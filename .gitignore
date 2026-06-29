@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.venv/
+.claude-token-saver/
+daemon.pid
+daemon.log
+*.db
+*.sqlite
