@@ -1,0 +1,24 @@
+[project]
+name = "claude-token-saver"
+version = "0.1.0"
+description = "Claude Code token 节省综合工具套件"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.1",
+    "rich>=13.7",
+    "tiktoken>=0.7",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+]
+
+[project.scripts]
+claude-token-saver = "claude_token_saver.cli:main"
+cts = "claude_token_saver.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

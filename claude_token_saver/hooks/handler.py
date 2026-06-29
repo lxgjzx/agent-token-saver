@@ -1,0 +1,270 @@
+"""
+Claude Code Token Saver - Hook Handler
+处理 Claude Code 的 PreToolUse 和 PostToolUse hooks。
+
+从 stdin 读取 JSON 事件，输出 JSON 决策到 stdout，警告输出到 stderr。
+仅使用标准库（json, sys, pathlib, sqlite3）及同包 utils 模块。
+"""
+from __future__ import annotations
+
+import json
+import sqlite3
+import sys
+from datetime import datetime
+from pathlib import Path
+
+from claude_token_saver.utils import get_file_size
+
+# ── 常量 ──────────────────────────────────────────────────────────────
+
+# 默认大文件阈值（字节），约 200KB
+DEFAULT_MAX_FILE_SIZE_BYTES: int = 200_000
+
+# 分析数据库路径
+ANALYTICS_DB: Path = Path.home() / ".claude-token-saver" / "analytics.db"
+
+# 默认排除目录
+DEFAULT_EXCLUDE_DIRS: set[str] = {
+    ".git", ".svn", ".hg", "__pycache__", "node_modules",
+    ".venv", "venv", "dist", "build", ".idea", ".vscode",
+    ".gradle", "target", "bin", "obj",
+}
+
+# 默认排除文件
+DEFAULT_EXCLUDE_FILES: set[str] = {
+    ".DS_Store", "Thumbs.db",
+}
+
+
+# ── 数据库操作 ────────────────────────────────────────────────────────
+
+def _init_db(db_path: Path) -> None:
+    """初始化 tool_usage 和 waste_log 表（如不存在）。"""
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS tool_usage (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            tool_name   TEXT    NOT NULL,
+            tool_input  TEXT    DEFAULT '{}',
+            tool_output TEXT    DEFAULT '{}',
+            file_path   TEXT,
+            file_size   INTEGER DEFAULT 0,
+            decision    TEXT    DEFAULT 'approve',
+            session_id  TEXT,
+            timestamp   TEXT    NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS waste_log (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            category      TEXT    NOT NULL,
+            description   TEXT    NOT NULL,
+            tokens_wasted INTEGER DEFAULT 0,
+            suggestion    TEXT    DEFAULT '',
+            timestamp     TEXT    NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def _record_tool_usage(
+    tool_name: str,
+    tool_input: dict,
+    tool_output: dict | None,
+    file_path: str | None,
+    file_size: int,
+    decision: str,
+    session_id: str | None,
+) -> None:
+    """记录 tool 使用到 analytics DB。"""
+    _init_db(ANALYTICS_DB)
+    conn = sqlite3.connect(ANALYTICS_DB)
+    conn.execute(
+        "INSERT INTO tool_usage "
+        "(tool_name, tool_input, tool_output, file_path, file_size, decision, session_id, timestamp) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            tool_name,
+            json.dumps(tool_input, ensure_ascii=False),
+            json.dumps(tool_output or {}, ensure_ascii=False),
+            file_path,
+            file_size,
+            decision,
+            session_id,
+            datetime.now().isoformat(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+# ── 工具函数 ──────────────────────────────────────────────────────────
+
+def _warn_large_file(file_path: str, file_size: int) -> None:
+    """输出大文件警告到 stderr。"""
+    size_kb = file_size / 1024
+    print(
+        f"[claude-token-saver] 警告: 文件 '{file_path}' 过大 "
+        f"({size_kb:.1f} KB)。建议使用偏移量读取部分内容。",
+        file=sys.stderr,
+    )
+
+
+def _add_exclude_paths_to_input(tool_input: dict, tool_name: str) -> dict:
+    """为 Glob/Grep 添加排除路径。"""
+    modified = dict(tool_input)
+
+    if tool_name == "Glob":
+        # Glob 工具支持 excludeDirs 参数
+        existing_excludes = modified.get("excludeDirs", [])
+        if isinstance(existing_excludes, list):
+            new_excludes = list(existing_excludes)
+            for d in DEFAULT_EXCLUDE_DIRS:
+                if d not in new_excludes:
+                    new_excludes.append(d)
+            modified["excludeDirs"] = new_excludes
+
+    elif tool_name == "Grep":
+        # Grep 工具支持 exclude 参数（管道分隔的 glob 模式）
+        exclude_patterns = [f"*/{d}/**" for d in sorted(DEFAULT_EXCLUDE_DIRS)]
+        for f in sorted(DEFAULT_EXCLUDE_FILES):
+            exclude_patterns.append(f"**/{f}")
+
+        existing_exclude = modified.get("exclude", "")
+        if existing_exclude:
+            modified["exclude"] = existing_exclude + "|" + "|".join(exclude_patterns)
+        else:
+            modified["exclude"] = "|".join(exclude_patterns)
+
+    return modified
+
+
+# ── 事件处理 ──────────────────────────────────────────────────────────
+
+def handle_pre_tool(tool_name: str, tool_input: dict, session_id: str | None = None) -> dict:
+    """处理 PreToolUse 事件。
+
+    - Read: 检查文件大小，过大则输出 stderr 警告
+    - Glob/Grep: 自动添加排除路径到 input
+    """
+    modified_input = dict(tool_input)
+    decision = "approve"
+    file_path: str | None = None
+    file_size: int = 0
+
+    if tool_name == "Read":
+        file_path = tool_input.get("file_path", "")
+        if file_path:
+            path = Path(file_path)
+            if path.exists():
+                try:
+                    file_size = get_file_size(path)
+                    if file_size > DEFAULT_MAX_FILE_SIZE_BYTES:
+                        _warn_large_file(file_path, file_size)
+                except OSError:
+                    pass
+
+    elif tool_name in ("Glob", "Grep"):
+        modified_input = _add_exclude_paths_to_input(tool_input, tool_name)
+
+    result: dict = {"decision": decision, "reason": ""}
+
+    if modified_input != tool_input:
+        result["modified_input"] = modified_input
+
+    _record_tool_usage(tool_name, tool_input, None, file_path, file_size, decision, session_id)
+
+    return result
+
+
+def handle_post_tool(
+    tool_name: str,
+    tool_input: dict,
+    tool_output: dict,
+    session_id: str | None = None,
+) -> dict:
+    """处理 PostToolUse 事件。
+
+    - 记录所有 tool 使用到 analytics DB
+    - 大文件读取记录浪费
+    """
+    file_path: str | None = None
+    file_size: int = 0
+
+    if tool_name == "Read":
+        file_path = tool_input.get("file_path", "")
+        if file_path:
+            path = Path(file_path)
+            if path.exists():
+                try:
+                    file_size = get_file_size(path)
+                except OSError:
+                    pass
+
+    # 记录大文件读取浪费
+    if tool_name == "Read" and file_path and file_size > DEFAULT_MAX_FILE_SIZE_BYTES:
+        _init_db(ANALYTICS_DB)
+        conn = sqlite3.connect(ANALYTICS_DB)
+        tokens_wasted = file_size // 4
+        conn.execute(
+            "INSERT INTO waste_log "
+            "(category, description, tokens_wasted, suggestion, timestamp) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                "大文件读取",
+                f"读取大文件: {file_path} ({file_size / 1024:.1f} KB)",
+                tokens_wasted,
+                "使用 --offset 和 --limit 参数只读取需要的部分",
+                datetime.now().isoformat(),
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+    _record_tool_usage(tool_name, tool_input, tool_output, file_path, file_size, "approve", session_id)
+
+    return {"decision": "approve", "reason": ""}
+
+
+# ── 主入口 ────────────────────────────────────────────────────────────
+
+def main() -> None:
+    """从 stdin 读取 JSON 事件，处理并输出 JSON 结果到 stdout。"""
+    try:
+        raw = sys.stdin.read()
+        if not raw.strip():
+            print(json.dumps({"decision": "approve", "reason": ""}), file=sys.stdout)
+            sys.exit(0)
+
+        event = json.loads(raw)
+    except (json.JSONDecodeError, IOError, UnicodeDecodeError):
+        print(json.dumps({"decision": "approve", "reason": ""}), file=sys.stdout)
+        sys.exit(0)
+
+    tool_name: str = event.get("tool_name", "")
+    tool_input: dict = event.get("tool_input", {})
+    tool_output: dict | None = event.get("tool_output")
+    session_id: str | None = event.get("session_id")
+    event_type: str = event.get("hook_event_name", "")
+
+    if not tool_name:
+        print(json.dumps({"decision": "approve", "reason": "no tool_name"}), file=sys.stdout)
+        sys.exit(0)
+
+    try:
+        if event_type == "PreToolUse":
+            result = handle_pre_tool(tool_name, tool_input, session_id)
+        elif event_type == "PostToolUse":
+            result = handle_post_tool(tool_name, tool_input, tool_output or {}, session_id)
+        else:
+            result = {"decision": "approve", "reason": f"unknown event type: {event_type}"}
+    except Exception:
+        result = {"decision": "approve", "reason": ""}
+
+    print(json.dumps(result), file=sys.stdout)
+
+
+if __name__ == "__main__":
+    main()

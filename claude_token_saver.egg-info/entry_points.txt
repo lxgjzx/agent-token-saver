@@ -1,0 +1,3 @@
+[console_scripts]
+claude-token-saver = claude_token_saver.cli:main
+cts = claude_token_saver.cli:main
