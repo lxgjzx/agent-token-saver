@@ -16,6 +16,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from claude_token_saver.utils import count_tokens
+
 
 # ── 语言支持 ────────────────────────────────────────────────────────────
 
@@ -120,14 +122,21 @@ def _extract_python_skeleton(content: str) -> str:
     for s, e in merged:
         if s > prev_end:
             omitted = s - prev_end
-            kept_lines.append(f"    # ... [省略 {omitted} 行] ...")
+            # 使用紧凑标记，省略少于 3 行时省略标记本身不划算，直接跳过
+            if omitted >= 3:
+                kept_lines.append(f"# ... ({omitted} lines) ...")
         kept_lines.extend(lines[s:e])
         prev_end = e
     if prev_end < len(lines):
         omitted = len(lines) - prev_end
-        kept_lines.append(f"    # ... [省略 {omitted} 行] ...")
+        if omitted >= 3:
+            kept_lines.append(f"# ... ({omitted} lines) ...")
 
-    return "\n".join(kept_lines)
+    skeleton = "\n".join(kept_lines)
+    # 如果骨架比原文还长，返回原文（不产生负收益）
+    if count_tokens(skeleton) >= count_tokens(content):
+        return content
+    return skeleton
 
 
 def _extract_js_ts_skeleton(content: str) -> str:

@@ -190,6 +190,14 @@ def _safe_resolve_path(file_path: str) -> str | None:
     """安全规范化路径：防止路径遍历，只允许在工作目录范围内。"""
     if not file_path:
         return None
+    # 拒绝包含空字节的路径（Windows 上 Path.resolve() 不对此报错）
+    if "\x00" in file_path:
+        _record_security_event(
+            "path_traversal_attempt",
+            f"路径遍历尝试被阻止（空字节）: {file_path[:50]}",
+            f"cwd={Path.cwd()}",
+        )
+        return None
     resolved = None
     try:
         resolved = Path(file_path).resolve()

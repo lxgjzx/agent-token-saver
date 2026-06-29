@@ -452,14 +452,22 @@ def _process_content(
     ext = fp.suffix.lower()
 
     if detail_level == "skeleton" and ext in {".py", ".js", ".ts", ".java", ".c", ".cpp", ".h", ".go", ".rs"}:
-        # 最高压缩：仅符号索引 + 骨架
+        # 最高压缩：符号索引 + 骨架
         symbols = extract_symbol_index(content, ext)
         if symbols:
             skeleton = extract_skeleton(content, ext)
-            header = format_symbol_index(symbols, str(fp))
-            return header + "\n\n" + skeleton if header else skeleton
-        # 回退到 stripped
-        detail_level = "stripped"
+            # 如果骨架本身不节省 token，回退到 stripped
+            if count_tokens(skeleton) >= count_tokens(content):
+                detail_level = "stripped"
+            else:
+                header = format_symbol_index(symbols, str(fp))
+                combined = header + "\n\n" + skeleton if header else skeleton
+                # 只在 combined 更优时才带上 header
+                if count_tokens(combined) < count_tokens(skeleton):
+                    return combined
+                return skeleton
+        else:
+            detail_level = "stripped"
 
     if detail_level in ("skeleton", "stripped"):
         # 去除注释
