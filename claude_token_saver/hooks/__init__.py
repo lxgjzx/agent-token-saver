@@ -72,7 +72,7 @@ def merge_json_config(base: dict, overlay: dict) -> dict:
     递归合并字典；列表按元素去重合并（hooks 配置按 matcher 合并）。
     """
     try:
-        result = json.loads(json.dumps(base))
+        result = _deep_copy(base)
     except (TypeError, ValueError):
         result = dict(base)
 
@@ -89,12 +89,17 @@ def merge_json_config(base: dict, overlay: dict) -> dict:
                         merged.append(item)
                 result[key] = merged
         else:
-            try:
-                result[key] = json.loads(json.dumps(value))
-            except (TypeError, ValueError):
-                result[key] = value
+            result[key] = _deep_copy(value)
 
     return result
+
+
+def _deep_copy(obj):
+    """深拷贝辅助，使用 JSON 序列化避免共享可变状态。"""
+    try:
+        return json.loads(json.dumps(obj))
+    except (TypeError, ValueError):
+        return obj
 
 
 def _is_hooks_list(lst: list) -> bool:
@@ -126,48 +131,9 @@ def _merge_hooks_lists(base_list: list, overlay_list: list) -> list:
                 merged_entry["hooks"] = merged_hooks
                 existing[matcher_key] = merged_entry
         else:
-            existing[matcher_key] = json.loads(json.dumps(new_entry))
+            existing[matcher_key] = _deep_copy(new_entry)
 
     return list(existing.values())
-
-
-def _merge_hooks_config(base_hooks: dict, overlay_hooks: dict) -> dict:
-    """合并 hooks 配置，按 matcher 去重，hooks 列表追加。"""
-    result = json.loads(json.dumps(base_hooks))
-
-    for event_type, matchers in overlay_hooks.items():
-        if event_type not in result:
-            result[event_type] = json.loads(json.dumps(matchers))
-            continue
-
-        base_matchers = result[event_type]
-        if not isinstance(base_matchers, list):
-            result[event_type] = json.loads(json.dumps(matchers))
-            continue
-
-        existing = {m.get("matcher", ""): m for m in base_matchers if isinstance(m, dict)}
-
-        for new_entry in matchers:
-            if not isinstance(new_entry, dict):
-                continue
-            matcher_key = new_entry.get("matcher", "")
-            if matcher_key in existing:
-                existing_hooks = existing[matcher_key].get("hooks", [])
-                new_hooks = new_entry.get("hooks", [])
-                if isinstance(existing_hooks, list) and isinstance(new_hooks, list):
-                    merged_hooks = list(existing_hooks)
-                    for hook in new_hooks:
-                        if hook not in merged_hooks:
-                            merged_hooks.append(hook)
-                    merged_entry = dict(existing[matcher_key])
-                    merged_entry["hooks"] = merged_hooks
-                    existing[matcher_key] = merged_entry
-            else:
-                existing[matcher_key] = json.loads(json.dumps(new_entry))
-
-        result[event_type] = list(existing.values())
-
-    return result
 
 
 def install_hooks() -> str:

@@ -170,14 +170,13 @@ def _safe_resolve_path(file_path: str) -> str | None:
         return None
     try:
         resolved = Path(file_path).resolve()
+        cwd = Path.cwd().resolve()
+        resolved.relative_to(cwd)
     except (OSError, ValueError):
-        return None
-    cwd = Path.cwd()
-    if not str(resolved).startswith(str(cwd)):
         _record_security_event(
             "path_traversal_attempt",
             f"路径遍历尝试被阻止: {file_path}",
-            f"cwd={cwd}, resolved={resolved}",
+            f"cwd={Path.cwd()}, resolved={resolved}",
         )
         return None
     return str(resolved)

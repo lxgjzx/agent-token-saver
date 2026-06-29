@@ -80,7 +80,7 @@ def _strip_python_comments_safe(content: str) -> str:
                 string_ranges.append((start, end))
 
     # 标记受保护的字符范围
-    protected = [False] * len(content)
+    protected = [False] * len(lines)
     for start, end in string_ranges:
         for i in range(start, min(end, len(lines))):
             protected[i] = True
@@ -260,7 +260,6 @@ def process_files(
     """
     if dedup:
         file_paths = deduplicate_files(list(file_paths))
-        dup_count = len(file_paths)  # will be updated below
 
     results = []
     total_before = 0
@@ -292,9 +291,7 @@ def process_files(
             seen_hashes.add(content_hash)
 
             # 去除注释
-            if do_strip_comments and fp.suffix.lower() in _COMMENT_PATTERNS:
-                content = strip_comments(content, fp.suffix.lower())
-            elif do_strip_comments:
+            if do_strip_comments:
                 content = strip_comments(content, fp.suffix.lower())
 
             # 去除 Python docstring

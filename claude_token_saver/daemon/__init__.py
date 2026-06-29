@@ -167,6 +167,43 @@ def _record_event(event: dict[str, Any]) -> None:
     conn.close()
 
 
+def _batch_record_events(events: list[dict[str, Any]]) -> None:
+    """批量插入事件到 parsed_events 表（单事务，减少 I/O 开销）。"""
+    if not events:
+        return
+    now = _utcnow()
+    rows = [
+        (
+            e.get("session_id", ""),
+            e.get("event_type", ""),
+            e.get("model", ""),
+            e.get("input_tokens", 0) or 0,
+            e.get("output_tokens", 0) or 0,
+            e.get("cache_creation_tokens", 0) or 0,
+            e.get("cache_read_tokens", 0) or 0,
+            e.get("tool_name", ""),
+            e.get("tool_input", "")[:1000],
+            e.get("tool_output_preview", "")[:500],
+            e.get("file_path", ""),
+            e.get("cwd", ""),
+            e.get("timestamp", ""),
+            now,
+        )
+        for e in events
+    ]
+    conn = _get_conn()
+    conn.executemany(
+        """INSERT INTO parsed_events
+           (session_id, event_type, model, input_tokens, output_tokens,
+            cache_creation_tokens, cache_read_tokens, tool_name, tool_input,
+            tool_output_preview, file_path, cwd, timestamp, parsed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        rows,
+    )
+    conn.commit()
+    conn.close()
+
+
 def _record_alert(level: str, category: str, message: str,
                   data: dict[str, Any] | None = None) -> None:
     conn = _get_conn()
@@ -266,6 +303,7 @@ def parse_transcript(file_path: Path) -> tuple[int, int]:
 
     基于文件偏移量和 mtime 做增量解析，避免重复处理已读内容。
     如果文件被截断或重写，则从头重新解析。
+    批量写入数据库（单事务），减少 I/O 开销。
 
     Args:
         file_path: transcript JSONL 文件路径
@@ -295,6 +333,7 @@ def parse_transcript(file_path: Path) -> tuple[int, int]:
 
     parsed = 0
     skipped = 0
+    batch: list[dict[str, Any]] = []
     try:
         with open(file_path, "r", encoding="utf-8", errors="replace") as f:
             f.seek(offset)
@@ -305,7 +344,7 @@ def parse_transcript(file_path: Path) -> tuple[int, int]:
                 event = parse_transcript_line(line)
                 if event:
                     event["source_file"] = str(file_path)
-                    _record_event(event)
+                    batch.append(event)
                     parsed += 1
                 else:
                     skipped += 1
@@ -313,6 +352,10 @@ def parse_transcript(file_path: Path) -> tuple[int, int]:
     except (OSError, IOError) as e:
         log.warning("读取文件失败 %s: %s", file_path, e)
         return (0, 0)
+
+    # 批量写入数据库
+    if batch:
+        _batch_record_events(batch)
 
     _update_scan_state(str(file_path), new_offset, mtime)
     return (parsed, skipped)
@@ -429,17 +472,13 @@ class _DaemonRequestHandler(BaseHTTPRequestHandler):
     # ── 路由 ──
 
     def do_GET(self) -> None:
-        # API Token 认证
-        auth_header = self.headers.get("Authorization", "")
-        query_token = ""
-        if "?" in self.path:
-            query = self.path.split("?", 1)[1]
-            for pair in query.split("&"):
-                if pair.startswith("token="):
-                    query_token = pair.split("=", 1)[1]
-                    break
+        # API Token 认证（支持 Authorization: Bearer 或 ?token= 查询参数）
+        from urllib.parse import parse_qs
+        query_params = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+        query_token = query_params.get("token", [""])[0]
 
-        token = auth_header.replace("Bearer ", "") or query_token
+        auth_header = self.headers.get("Authorization", "")
+        token = auth_header.replace("Bearer ", "", 1) or query_token
         if not _verify_api_token(token):
             self._err(401, "Unauthorized: missing or invalid API token")
             return
@@ -770,6 +809,9 @@ def _utcnow() -> str:
 # API Token 管理
 # ═══════════════════════════════════════════════════════════════════════════════
 
+_API_TOKEN_CACHE: str | None = None
+
+
 def _generate_api_token() -> str:
     """生成随机 API token 并保存到文件。"""
     import secrets
@@ -777,15 +819,25 @@ def _generate_api_token() -> str:
     DAEMON_DIR.mkdir(parents=True, exist_ok=True)
     API_TOKEN_FILE.write_text(token, encoding="utf-8")
     API_TOKEN_FILE.chmod(0o600)  # 仅所有者可读
+    _invalidate_api_token_cache()
     return token
 
 
+def _invalidate_api_token_cache() -> None:
+    global _API_TOKEN_CACHE
+    _API_TOKEN_CACHE = None
+
+
 def _get_api_token() -> str | None:
-    """从文件读取 API token。"""
+    """从文件读取 API token（带内存缓存）。"""
+    global _API_TOKEN_CACHE
+    if _API_TOKEN_CACHE is not None:
+        return _API_TOKEN_CACHE
     if not API_TOKEN_FILE.exists():
         return None
     try:
-        return API_TOKEN_FILE.read_text(encoding="utf-8").strip()
+        _API_TOKEN_CACHE = API_TOKEN_FILE.read_text(encoding="utf-8").strip()
+        return _API_TOKEN_CACHE
     except OSError:
         return None
 
@@ -807,14 +859,7 @@ def _run_detached(
     http_port: int = HTTP_PORT,
 ) -> None:
     """在独立进程中运行 daemon（由 subprocess.Popen 调用）。"""
-    import logging
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[
-            logging.FileHandler(LOG_FILE, encoding="utf-8"),
-        ],
-    )
+    _setup_logger()  # 复用模块级日志配置
     daemon = TokenDaemon(scan_interval=scan_interval, http_port=http_port)
     daemon.start()
     daemon.run_forever()
@@ -840,25 +885,17 @@ def start_daemon(
         return False
 
     if foreground:
-        # 前台模式：在当前进程中运行
-        daemon = TokenDaemon(
-            scan_interval=scan_interval,
-            http_port=http_port,
-        )
-        ok = daemon.start()
-        if not ok:
-            return False
-        daemon.run_forever()
+        # 前台模式：复用 _run_detached（在当前进程运行）
+        _run_detached(scan_interval=scan_interval, http_port=http_port)
         return True
     else:
-        # 后台模式：使用 subprocess.Popen 启动独立进程
-        # 这样 PID 文件中的 PID 才是真正的 daemon 进程
+        # 后台模式：使用 subprocess 启动独立进程
         import subprocess
         import sys
 
         DAEMON_DIR.mkdir(parents=True, exist_ok=True)
 
-        # 确保 API token 存在
+        # 确保 API token 存在（子进程也会检查，但提前生成避免竞态）
         if not _get_api_token():
             _generate_api_token()
 
@@ -876,7 +913,6 @@ def start_daemon(
             )
             log.info("Daemon 子进程已启动 PID=%d", proc.pid)
             # 等待子进程写入 PID 文件
-            import time
             for _ in range(20):
                 pid = _read_pid_static()
                 if pid and _is_pid_alive(pid):
@@ -980,22 +1016,23 @@ def get_daemon_status() -> dict[str, Any]:
     # 如果正在运行，尝试获取实时状态
     if running and pid:
         try:
-            token = _get_api_token()
-            headers = {}
-            if token:
-                headers["Authorization"] = f"Bearer {token}"
-            import urllib.request
-            req = urllib.request.urlopen(
-                f"http://127.0.0.1:{HTTP_PORT}/status", timeout=2,
-            )
-            data = json.loads(req.read().decode("utf-8"))
-            result["uptime_seconds"] = data.get("uptime_seconds")
-            result["scanner_alive"] = data.get("scanner_alive")
-            result["http_reachable"] = True
+            api_token = _get_api_token()
+            if api_token:
+                import urllib.request
+                req = urllib.request.urlopen(
+                    f"http://127.0.0.1:{HTTP_PORT}/status", timeout=2,
+                    headers={"Authorization": f"Bearer {api_token}"},
+                )
+                data = json.loads(req.read().decode("utf-8"))
+                result["uptime_seconds"] = data.get("uptime_seconds")
+                result["scanner_alive"] = data.get("scanner_alive")
+                result["http_reachable"] = True
+            else:
+                result["http_reachable"] = False
         except Exception:
             result["http_reachable"] = False
 
-    # 脱敏展示 API token
+    # 脱敏展示 API token（只读一次磁盘）
     api_token = _get_api_token()
     if api_token:
         result["api_token_prefix"] = api_token[:8]
