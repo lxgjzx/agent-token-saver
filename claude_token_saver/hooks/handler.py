@@ -6,7 +6,7 @@ Claude Code Token Saver - Hook Handler
 仅使用标准库（json, sys, pathlib, sqlite3）及同包 utils 模块。
 
 Token 节省策略：
-  - 大文件读取阻止（>500KB 直接阻止，建议使用 --offset/--limit）
+  - 大文件读取询问（>500KB 询问用户是否继续，建议使用 --offset/--limit）
   - Glob 结果数量限制（注入 maxResults=100）
   - Grep 结果数量限制（注入 maxMatches=50）
   - 目录排除注入（自动排除 node_modules/.venv/.git 等）
@@ -216,7 +216,7 @@ def _safe_resolve_path(file_path: str) -> str | None:
 def handle_pre_tool(tool_name: str, tool_input: dict, session_id: str | None = None) -> dict:
     """处理 PreToolUse 事件。
 
-    - Read: 检查文件大小，过大则阻止或警告
+    - Read: 检查文件大小，过大则询问用户是否继续
     - Glob/Grep: 自动添加排除路径和结果数量限制
     """
     modified_input = dict(tool_input)
@@ -235,9 +235,12 @@ def handle_pre_tool(tool_name: str, tool_input: dict, session_id: str | None = N
                 try:
                     file_size = get_file_size(path)
                     if file_size > BLOCK_MAX_FILE_SIZE_BYTES:
-                        # 超大文件：阻止读取
-                        decision = "block"
-                        reason = _warn_large_file(safe_path, file_size)
+                        # 超大文件：询问用户是否继续
+                        decision = "ask"
+                        reason = (
+                            f"[claude-token-saver] 文件过大 ({file_size / 1024:.0f} KB)，"
+                            f"建议使用 --offset 和 --limit 参数只读取需要的部分。是否继续？"
+                        )
                     elif file_size > DEFAULT_MAX_FILE_SIZE_BYTES:
                         # 大文件：警告但允许
                         reason = _warn_large_file(safe_path, file_size)

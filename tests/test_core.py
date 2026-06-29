@@ -254,14 +254,14 @@ class Baz: pass
 
 class TestHookHandlerEnhanced:
     def test_block_large_read(self, tmp_path, monkeypatch):
-        """大文件（>500KB）应被阻止。"""
+        """大文件（>500KB）应询问用户而非直接阻止。"""
         from claude_token_saver.hooks.handler import handle_pre_tool, _safe_resolve_path
         large_file = tmp_path / "large.txt"
         large_file.write_text("x" * 600_000)
         # mock _safe_resolve_path 绕过 cwd 检查（测试环境下 tmp_path 不在 cwd 内）
         monkeypatch.setattr("claude_token_saver.hooks.handler._safe_resolve_path", lambda p: str(large_file))
         result = handle_pre_tool("Read", {"file_path": str(large_file)})
-        assert result["decision"] == "block"
+        assert result["decision"] == "ask"
 
     def test_warn_medium_read(self, tmp_path, monkeypatch):
         """中等文件（200-500KB）应警告但允许。"""
