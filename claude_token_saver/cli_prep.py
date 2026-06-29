@@ -26,6 +26,8 @@ def prep() -> None:
 @click.option("--strip-docstrings", is_flag=True, help="去除 Python 文档字符串")
 @click.option("--no-dedup", is_flag=True, help="不去重")
 @click.option("--max-tokens", type=int, default=50_000, help="单文件最大 token 数")
+@click.option("--detail-level", type=click.Choice(["skeleton", "stripped", "full", "block"]), default="full", help="压缩级别: skeleton(5-10%%), stripped(30-50%%), full, block(阻止超大文件)")
+@click.option("--no-cache", is_flag=True, help="禁用文件缓存（强制重新处理）")
 @click.option("--dry-run", is_flag=True, help="仅显示统计，不输出内容")
 @click.option("--include-binary", is_flag=True, help="包含二进制文件")
 @click.option("-v", "--verbose", is_flag=True, help="显示详细信息")
@@ -37,11 +39,20 @@ def prep_files(
     strip_docstrings: bool,
     no_dedup: bool,
     max_tokens: int,
+    detail_level: str,
+    no_cache: bool,
     dry_run: bool,
     include_binary: bool,
     verbose: bool,
 ) -> None:
-    """处理文件列表，输出精简后的内容。"""
+    """处理文件列表，输出精简后的内容。
+
+    detail-level 选项:
+      skeleton - 仅提取类/函数签名（Python 文件 ~5-10%% token）
+      stripped - 去除注释和 docstring（~30-50%% token）
+      full     - 完整内容（默认）
+      block    - 阻止读取超大文件（不读取内容）
+    """
     config = load_config()
     file_paths = list(paths)
 
@@ -67,11 +78,15 @@ def prep_files(
         max_file_tokens=max_tokens,
         dedup=not no_dedup,
         include_binary=include_binary,
+        detail_level=detail_level,
+        token_cache_enabled=not no_cache,
     )
 
     # 输出统计
-    click.echo(f"📊 处理结果：")
+    click.echo(f"📊 处理结果（级别: {detail_level}）：")
     click.echo(f"   文件数: {len(result['files'])}")
+    if result.get("cache_hits"):
+        click.echo(f"   缓存命中: {result['cache_hits']} 个文件（跳过重新处理）")
     if result["duplicates_removed"]:
         click.echo(f"   去重: {result['duplicates_removed']} 个重复文件已移除")
     if result["skipped"]:
@@ -80,7 +95,7 @@ def prep_files(
                f"({result['savings_pct']}% 节省)")
 
     if verbose and result["files"]:
-        click.echo(f"\n📁 各文件节省情况：")
+        click.echo(f"\n📁 各文件节省情况（detail={detail_level}）：")
         click.echo(f"   {'文件':<50} {'压缩前':>10} {'压缩后':>10} {'节省':>10}")
         click.echo(f"   {'─' * 50} {'─' * 10} {'─' * 10} {'─' * 10}")
         for f in result["files"]:

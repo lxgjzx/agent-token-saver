@@ -4,6 +4,12 @@ Claude Code Token Saver - Hook Handler
 
 从 stdin 读取 JSON 事件，输出 JSON 决策到 stdout，警告输出到 stderr。
 仅使用标准库（json, sys, pathlib, sqlite3）及同包 utils 模块。
+
+Token 节省策略：
+  - 大文件读取阻止（>500KB 直接阻止，建议使用 --offset/--limit）
+  - Glob 结果数量限制（注入 maxResults=100）
+  - Grep 结果数量限制（注入 maxMatches=50）
+  - 目录排除注入（自动排除 node_modules/.venv/.git 等）
 """
 from __future__ import annotations
 
@@ -19,6 +25,15 @@ from claude_token_saver.utils import get_file_size
 
 # 默认大文件阈值（字节），约 200KB
 DEFAULT_MAX_FILE_SIZE_BYTES: int = 200_000
+
+# 阻止读取的阈值（字节），约 500KB — 超过此大小的文件直接阻止
+BLOCK_MAX_FILE_SIZE_BYTES: int = 500_000
+
+# Glob 最大结果数
+DEFAULT_GLOB_MAX_RESULTS: int = 100
+
+# Grep 最大匹配数
+DEFAULT_GREP_MAX_MATCHES: int = 50
 
 # 分析数据库路径
 ANALYTICS_DB: Path = Path.home() / ".claude-token-saver" / "analytics.db"
@@ -123,18 +138,17 @@ def _record_tool_usage(
 
 # ── 工具函数 ──────────────────────────────────────────────────────────
 
-def _warn_large_file(file_path: str, file_size: int) -> None:
-    """输出大文件警告到 stderr。"""
+def _warn_large_file(file_path: str, file_size: int) -> str:
+    """生成大文件警告文本。"""
     size_kb = file_size / 1024
-    print(
-        f"[claude-token-saver] 警告: 文件 '{file_path}' 过大 "
-        f"({size_kb:.1f} KB)。建议使用偏移量读取部分内容。",
-        file=sys.stderr,
+    return (
+        f"[claude-token-saver] 文件过大 ({size_kb:.0f} KB)，"
+        f"建议使用 --offset 和 --limit 参数只读取需要的部分。"
     )
 
 
 def _add_exclude_paths_to_input(tool_input: dict, tool_name: str) -> dict:
-    """为 Glob/Grep 添加排除路径。"""
+    """为 Glob/Grep 添加排除路径和结果数量限制。"""
     modified = dict(tool_input)
 
     if tool_name == "Glob":
@@ -147,6 +161,10 @@ def _add_exclude_paths_to_input(tool_input: dict, tool_name: str) -> dict:
                     new_excludes.append(d)
             modified["excludeDirs"] = new_excludes
 
+        # 限制结果数量（如果未设置）
+        if "maxResults" not in modified:
+            modified["maxResults"] = DEFAULT_GLOB_MAX_RESULTS
+
     elif tool_name == "Grep":
         # Grep 工具支持 exclude 参数（管道分隔的 glob 模式）
         exclude_patterns = [f"*/{d}/**" for d in sorted(DEFAULT_EXCLUDE_DIRS)]
@@ -158,6 +176,10 @@ def _add_exclude_paths_to_input(tool_input: dict, tool_name: str) -> dict:
             modified["exclude"] = existing_exclude + "|" + "|".join(exclude_patterns)
         else:
             modified["exclude"] = "|".join(exclude_patterns)
+
+        # 限制匹配数量（如果未设置）
+        if "maxMatches" not in modified:
+            modified["maxMatches"] = DEFAULT_GREP_MAX_MATCHES
 
     return modified
 
@@ -186,14 +208,15 @@ def _safe_resolve_path(file_path: str) -> str | None:
 def handle_pre_tool(tool_name: str, tool_input: dict, session_id: str | None = None) -> dict:
     """处理 PreToolUse 事件。
 
-    - Read: 检查文件大小，过大则输出 stderr 警告
-    - Glob/Grep: 自动添加排除路径到 input
+    - Read: 检查文件大小，过大则阻止或警告
+    - Glob/Grep: 自动添加排除路径和结果数量限制
     """
     modified_input = dict(tool_input)
     decision = "approve"
     file_path: str | None = None
     safe_path: str | None = None
     file_size: int = 0
+    reason = ""
 
     if tool_name == "Read":
         raw_path = tool_input.get("file_path", "")
@@ -203,8 +226,13 @@ def handle_pre_tool(tool_name: str, tool_input: dict, session_id: str | None = N
             if path.exists():
                 try:
                     file_size = get_file_size(path)
-                    if file_size > DEFAULT_MAX_FILE_SIZE_BYTES:
-                        _warn_large_file(safe_path, file_size)
+                    if file_size > BLOCK_MAX_FILE_SIZE_BYTES:
+                        # 超大文件：阻止读取
+                        decision = "block"
+                        reason = _warn_large_file(safe_path, file_size)
+                    elif file_size > DEFAULT_MAX_FILE_SIZE_BYTES:
+                        # 大文件：警告但允许
+                        reason = _warn_large_file(safe_path, file_size)
                 except OSError:
                     pass
         file_path = safe_path or ""
@@ -214,7 +242,7 @@ def handle_pre_tool(tool_name: str, tool_input: dict, session_id: str | None = N
         safe_path = _safe_resolve_path(raw_path) if raw_path else None
         modified_input = _add_exclude_paths_to_input(tool_input, tool_name)
 
-    result: dict = {"decision": decision, "reason": ""}
+    result: dict = {"decision": decision, "reason": reason}
 
     if modified_input != tool_input:
         result["modified_input"] = modified_input
