@@ -71,7 +71,10 @@ def merge_json_config(base: dict, overlay: dict) -> dict:
 
     递归合并字典；列表按元素去重合并（hooks 配置按 matcher 合并）。
     """
-    result = json.loads(json.dumps(base))
+    try:
+        result = json.loads(json.dumps(base))
+    except (TypeError, ValueError):
+        result = dict(base)
 
     for key, value in overlay.items():
         if key in result and isinstance(result[key], dict) and isinstance(value, dict):
@@ -86,7 +89,10 @@ def merge_json_config(base: dict, overlay: dict) -> dict:
                         merged.append(item)
                 result[key] = merged
         else:
-            result[key] = json.loads(json.dumps(value))
+            try:
+                result[key] = json.loads(json.dumps(value))
+            except (TypeError, ValueError):
+                result[key] = value
 
     return result
 

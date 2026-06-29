@@ -9,3 +9,4 @@ daemon.pid
 daemon.log
 *.db
 *.sqlite
+*.log

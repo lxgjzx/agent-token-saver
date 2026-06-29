@@ -46,11 +46,83 @@ _COMMENT_PATTERNS: dict[str, re.Pattern] = {
 
 
 def strip_comments(content: str, ext: str) -> str:
-    """去除文件中的注释内容。"""
+    """去除文件中的注释内容。
+
+    注意：非 Python 文件使用正则表达式，可能误伤字符串内的注释符号。
+    Python 文件使用 AST 保护字符串区域。
+    """
+    if ext.lower() == ".py":
+        return _strip_python_comments_safe(content)
     pattern = _COMMENT_PATTERNS.get(ext.lower())
     if pattern:
         return pattern.sub("", content)
     return content
+
+
+def _strip_python_comments_safe(content: str) -> str:
+    """安全去除 Python 注释：使用 AST 识别字符串区域，避免误伤。"""
+    try:
+        import ast
+        tree = ast.parse(content)
+    except SyntaxError:
+        # 回退到正则
+        pattern = _COMMENT_PATTERNS.get(".py")
+        return pattern.sub("", content) if pattern else content
+
+    lines = content.split("\n")
+    string_ranges: list[tuple[int, int]] = []
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if hasattr(node, "lineno") and hasattr(node, "end_lineno"):
+                start = node.lineno - 1
+                end = node.end_lineno
+                string_ranges.append((start, end))
+
+    # 标记受保护的字符范围
+    protected = [False] * len(content)
+    for start, end in string_ranges:
+        for i in range(start, min(end, len(lines))):
+            protected[i] = True
+
+    # 逐行处理，跳过字符串内的行
+    result_lines = []
+    for line_idx, line in enumerate(lines):
+        if protected[line_idx]:
+            result_lines.append(line)
+            continue
+        # 去除行内 # 注释（忽略字符串内的 #）
+        in_str = False
+        str_char = ""
+        result = []
+        i = 0
+        while i < len(line):
+            ch = line[i]
+            if not in_str and ch in ('"', "'"):
+                # 检查转义
+                if i > 0 and line[i - 1] == "\\":
+                    result.append(ch)
+                    i += 1
+                    continue
+                in_str = True
+                str_char = ch
+                result.append(ch)
+            elif in_str and ch == str_char:
+                if i > 0 and line[i - 1] == "\\":
+                    result.append(ch)
+                    i += 1
+                    continue
+                in_str = False
+                str_char = ""
+                result.append(ch)
+            elif not in_str and ch == "#":
+                break
+            else:
+                result.append(ch)
+            i += 1
+        result_lines.append("".join(result))
+
+    return "\n".join(result_lines)
 
 
 def strip_python_docstrings(content: str) -> str:
@@ -243,6 +315,8 @@ def process_files(
                 "content": content,
             })
         except Exception as e:
+            import logging
+            logging.getLogger("claude_token_saver.prep").warning("处理文件失败 %s: %s", fp, e)
             skipped.append(f"{fp} ({e})")
 
     savings_pct = ((total_before - total_after) / total_before * 100) if total_before else 0

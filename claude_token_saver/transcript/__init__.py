@@ -247,7 +247,7 @@ class TranscriptParser:
 
         # 第一遍：索引 tool_result（跨 user 类型的 tool_result 消息）
         tool_results: dict[str, dict] = {}
-        with open(file_path, "r", encoding="utf-8") as f:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -267,7 +267,7 @@ class TranscriptParser:
                                     tool_results[tool_use_id] = block
 
         # 第二遍：构建 session 和 turns
-        with open(file_path, "r", encoding="utf-8") as f:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.strip()
                 if not line:

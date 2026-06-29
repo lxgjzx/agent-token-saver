@@ -65,6 +65,27 @@ def _init_db(db_path: Path) -> None:
             timestamp     TEXT    NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS security_log (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type  TEXT    NOT NULL,
+            description TEXT    NOT NULL,
+            details     TEXT    DEFAULT '',
+            timestamp   TEXT    NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def _record_security_event(event_type: str, description: str, details: str = "") -> None:
+    """记录安全相关事件到 analytics DB。"""
+    _init_db(ANALYTICS_DB)
+    conn = sqlite3.connect(ANALYTICS_DB)
+    conn.execute(
+        "INSERT INTO security_log (event_type, description, details, timestamp) VALUES (?, ?, ?, ?)",
+        (event_type, description, details, datetime.now().isoformat()),
+    )
     conn.commit()
     conn.close()
 
@@ -143,6 +164,25 @@ def _add_exclude_paths_to_input(tool_input: dict, tool_name: str) -> dict:
 
 # ── 事件处理 ──────────────────────────────────────────────────────────
 
+def _safe_resolve_path(file_path: str) -> str | None:
+    """安全规范化路径：防止路径遍历，只允许在工作目录范围内。"""
+    if not file_path:
+        return None
+    try:
+        resolved = Path(file_path).resolve()
+    except (OSError, ValueError):
+        return None
+    cwd = Path.cwd()
+    if not str(resolved).startswith(str(cwd)):
+        _record_security_event(
+            "path_traversal_attempt",
+            f"路径遍历尝试被阻止: {file_path}",
+            f"cwd={cwd}, resolved={resolved}",
+        )
+        return None
+    return str(resolved)
+
+
 def handle_pre_tool(tool_name: str, tool_input: dict, session_id: str | None = None) -> dict:
     """处理 PreToolUse 事件。
 
@@ -152,21 +192,26 @@ def handle_pre_tool(tool_name: str, tool_input: dict, session_id: str | None = N
     modified_input = dict(tool_input)
     decision = "approve"
     file_path: str | None = None
+    safe_path: str | None = None
     file_size: int = 0
 
     if tool_name == "Read":
-        file_path = tool_input.get("file_path", "")
-        if file_path:
-            path = Path(file_path)
+        raw_path = tool_input.get("file_path", "")
+        safe_path = _safe_resolve_path(raw_path)
+        if safe_path:
+            path = Path(safe_path)
             if path.exists():
                 try:
                     file_size = get_file_size(path)
                     if file_size > DEFAULT_MAX_FILE_SIZE_BYTES:
-                        _warn_large_file(file_path, file_size)
+                        _warn_large_file(safe_path, file_size)
                 except OSError:
                     pass
+        file_path = safe_path or ""
 
     elif tool_name in ("Glob", "Grep"):
+        raw_path = tool_input.get("file_path", "")
+        safe_path = _safe_resolve_path(raw_path) if raw_path else None
         modified_input = _add_exclude_paths_to_input(tool_input, tool_name)
 
     result: dict = {"decision": decision, "reason": ""}
@@ -191,12 +236,14 @@ def handle_post_tool(
     - 大文件读取记录浪费
     """
     file_path: str | None = None
+    safe_path: str | None = None
     file_size: int = 0
 
     if tool_name == "Read":
-        file_path = tool_input.get("file_path", "")
-        if file_path:
-            path = Path(file_path)
+        raw_path = tool_input.get("file_path", "")
+        safe_path = _safe_resolve_path(raw_path)
+        if safe_path:
+            path = Path(safe_path)
             if path.exists():
                 try:
                     file_size = get_file_size(path)
@@ -204,7 +251,7 @@ def handle_post_tool(
                     pass
 
     # 记录大文件读取浪费
-    if tool_name == "Read" and file_path and file_size > DEFAULT_MAX_FILE_SIZE_BYTES:
+    if tool_name == "Read" and safe_path and file_size > DEFAULT_MAX_FILE_SIZE_BYTES:
         _init_db(ANALYTICS_DB)
         conn = sqlite3.connect(ANALYTICS_DB)
         tokens_wasted = file_size // 4
@@ -214,7 +261,7 @@ def handle_post_tool(
             "VALUES (?, ?, ?, ?, ?)",
             (
                 "大文件读取",
-                f"读取大文件: {file_path} ({file_size / 1024:.1f} KB)",
+                f"读取大文件: {safe_path} ({file_size / 1024:.1f} KB)",
                 tokens_wasted,
                 "使用 --offset 和 --limit 参数只读取需要的部分",
                 datetime.now().isoformat(),
@@ -223,7 +270,7 @@ def handle_post_tool(
         conn.commit()
         conn.close()
 
-    _record_tool_usage(tool_name, tool_input, tool_output, file_path, file_size, "approve", session_id)
+    _record_tool_usage(tool_name, tool_input, tool_output, safe_path, file_size, "approve", session_id)
 
     return {"decision": "approve", "reason": ""}
 
@@ -260,7 +307,8 @@ def main() -> None:
             result = handle_post_tool(tool_name, tool_input, tool_output or {}, session_id)
         else:
             result = {"decision": "approve", "reason": f"unknown event type: {event_type}"}
-    except Exception:
+    except Exception as e:
+        _record_security_event("handler_error", f"Hook handler 异常: {type(e).__name__}", str(e)[:500])
         result = {"decision": "approve", "reason": ""}
 
     print(json.dumps(result), file=sys.stdout)

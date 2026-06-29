@@ -145,6 +145,10 @@ def daemon_status(json_output: bool) -> None:
     else:
         click.echo("   HTTP API:       ❌ 不可达")
 
+    if status.get("api_token_prefix"):
+        click.echo(f"   API Token:      {status['api_token_prefix']}...{status['api_token_suffix']}")
+        click.echo(f"   Token 文件:     {status.get('api_token_file', 'N/A')}")
+
     click.echo(f"\n   📊 累计解析事件:  {status.get('total_events', 0):,}")
     click.echo(f"   📁 涉及会话数:    {status.get('total_sessions', 0)}")
     click.echo(f"   ⚠️  累计告警数:    {status.get('total_alerts', 0)}")

@@ -33,6 +33,7 @@ CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 DB_PATH = DAEMON_DIR / "daemon_analytics.db"
 SCAN_INTERVAL = 30  # 扫描间隔（秒）
 HTTP_PORT = 17890  # HTTP API 端口
+API_TOKEN_FILE = DAEMON_DIR / ".api_token"  # API 认证 token 文件
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -428,6 +429,21 @@ class _DaemonRequestHandler(BaseHTTPRequestHandler):
     # ── 路由 ──
 
     def do_GET(self) -> None:
+        # API Token 认证
+        auth_header = self.headers.get("Authorization", "")
+        query_token = ""
+        if "?" in self.path:
+            query = self.path.split("?", 1)[1]
+            for pair in query.split("&"):
+                if pair.startswith("token="):
+                    query_token = pair.split("=", 1)[1]
+                    break
+
+        token = auth_header.replace("Bearer ", "") or query_token
+        if not _verify_api_token(token):
+            self._err(401, "Unauthorized: missing or invalid API token")
+            return
+
         path = self.path.split("?")[0].rstrip("/") or "/"
 
         if path == "/status":
@@ -601,6 +617,11 @@ class TokenDaemon:
         self.start_time = time.time()
         self._setup_signal_handlers()
 
+        # 确保 API token 存在
+        if not _get_api_token():
+            token = _generate_api_token()
+            log.info("API token 已生成: %s...%s", token[:8], token[-4:])
+
         # 启动扫描器（守护线程）
         self.scanner = ScannerThread(self.scan_interval)
         self.scanner.start()
@@ -715,13 +736,28 @@ def _is_pid_alive(pid: int | None) -> bool:
 
 
 def _force_kill(pid: int) -> None:
-    """强制终止进程（Windows 兼容，使用 taskkill）。"""
-    import subprocess
+    """强制终止进程（仅限本 daemon 启动的进程）。"""
+    # 验证 PID 属于当前用户且属于本 daemon
+    try:
+        import subprocess
+        # 检查进程是否存在且属于当前用户
+        result = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if str(pid) not in result.stdout:
+            log.warning("PID %d 不存在或不属于当前用户，跳过终止", pid)
+            return
+    except Exception as e:
+        log.error("验证 PID %d 失败: %s", pid, e)
+        return
+
     try:
         subprocess.run(
             ["taskkill", "/F", "/PID", str(pid)],
             capture_output=True, timeout=5,
         )
+        log.info("已强制终止 PID %d", pid)
     except Exception as e:
         log.error("强制终止 PID %d 失败: %s", pid, e)
 
@@ -731,8 +767,58 @@ def _utcnow() -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# API Token 管理
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _generate_api_token() -> str:
+    """生成随机 API token 并保存到文件。"""
+    import secrets
+    token = secrets.token_urlsafe(32)
+    DAEMON_DIR.mkdir(parents=True, exist_ok=True)
+    API_TOKEN_FILE.write_text(token, encoding="utf-8")
+    API_TOKEN_FILE.chmod(0o600)  # 仅所有者可读
+    return token
+
+
+def _get_api_token() -> str | None:
+    """从文件读取 API token。"""
+    if not API_TOKEN_FILE.exists():
+        return None
+    try:
+        return API_TOKEN_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+
+def _verify_api_token(token: str | None) -> bool:
+    """验证 API token 是否匹配。"""
+    expected = _get_api_token()
+    if not expected or not token:
+        return False
+    return secrets.compare_digest(expected, token)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # 模块级公共 API
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def _run_detached(
+    scan_interval: int = SCAN_INTERVAL,
+    http_port: int = HTTP_PORT,
+) -> None:
+    """在独立进程中运行 daemon（由 subprocess.Popen 调用）。"""
+    import logging
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        ],
+    )
+    daemon = TokenDaemon(scan_interval=scan_interval, http_port=http_port)
+    daemon.start()
+    daemon.run_forever()
+
 
 def start_daemon(
     scan_interval: int = SCAN_INTERVAL,
@@ -748,38 +834,58 @@ def start_daemon(
 
     Returns:
         是否成功启动。已运行时返回 False。
-
-    注意:
-        默认非前台模式下，此函数会阻塞（因为后台线程需要主进程存活）。
-        如需在后台运行，请使用 subprocess 或线程调用本函数：
-          subprocess.Popen([sys.executable, "-c",
-              "from claude_token_saver.daemon import start_daemon; start_daemon(foreground=True)"])
     """
     if _is_pid_alive(_read_pid_static()):
         log.warning("Daemon 已在运行，请先执行 stop_daemon()")
         return False
 
-    daemon = TokenDaemon(
-        scan_interval=scan_interval,
-        http_port=http_port,
-    )
-    ok = daemon.start()
-    if not ok:
-        return False
-
     if foreground:
-        # 前台模式：阻塞，直到收到信号
+        # 前台模式：在当前进程中运行
+        daemon = TokenDaemon(
+            scan_interval=scan_interval,
+            http_port=http_port,
+        )
+        ok = daemon.start()
+        if not ok:
+            return False
         daemon.run_forever()
+        return True
     else:
-        # 非前台模式：保持主线程存活
-        try:
-            while daemon._http_stop_event.is_set() is False:
-                time.sleep(0.5)
-        except KeyboardInterrupt:
-            log.info("收到中断，停止 daemon")
-            daemon.stop()
+        # 后台模式：使用 subprocess.Popen 启动独立进程
+        # 这样 PID 文件中的 PID 才是真正的 daemon 进程
+        import subprocess
+        import sys
 
-    return True
+        DAEMON_DIR.mkdir(parents=True, exist_ok=True)
+
+        # 确保 API token 存在
+        if not _get_api_token():
+            _generate_api_token()
+
+        try:
+            proc = subprocess.Popen(
+                [
+                    sys.executable, "-c",
+                    f"from claude_token_saver.daemon import _run_detached; "
+                    f"_run_detached(scan_interval={scan_interval}, http_port={http_port})",
+                ],
+                creation_flags=subprocess.DETACHED_PROCESS if sys.platform == "win32" else 0,
+                close_fds=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            log.info("Daemon 子进程已启动 PID=%d", proc.pid)
+            # 等待子进程写入 PID 文件
+            import time
+            for _ in range(20):
+                pid = _read_pid_static()
+                if pid and _is_pid_alive(pid):
+                    return True
+                time.sleep(0.5)
+            return True
+        except Exception as e:
+            log.error("启动 daemon 子进程失败: %s", e)
+            return False
 
 
 def stop_daemon() -> bool:
@@ -874,9 +980,13 @@ def get_daemon_status() -> dict[str, Any]:
     # 如果正在运行，尝试获取实时状态
     if running and pid:
         try:
+            token = _get_api_token()
+            headers = {}
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
             import urllib.request
             req = urllib.request.urlopen(
-                f"http://127.0.0.1:{HTTP_PORT}/status", timeout=2
+                f"http://127.0.0.1:{HTTP_PORT}/status", timeout=2,
             )
             data = json.loads(req.read().decode("utf-8"))
             result["uptime_seconds"] = data.get("uptime_seconds")
@@ -884,6 +994,13 @@ def get_daemon_status() -> dict[str, Any]:
             result["http_reachable"] = True
         except Exception:
             result["http_reachable"] = False
+
+    # 脱敏展示 API token
+    api_token = _get_api_token()
+    if api_token:
+        result["api_token_prefix"] = api_token[:8]
+        result["api_token_suffix"] = api_token[-4:]
+        result["api_token_file"] = str(API_TOKEN_FILE)
 
     return result
 
