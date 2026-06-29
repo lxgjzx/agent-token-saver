@@ -4,9 +4,11 @@ Claude Code Token Saver - Hook 系统
 """
 from __future__ import annotations
 
+import copy
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 
 def get_hook_command() -> str:
@@ -71,10 +73,7 @@ def merge_json_config(base: dict, overlay: dict) -> dict:
 
     递归合并字典；列表按元素去重合并（hooks 配置按 matcher 合并）。
     """
-    try:
-        result = _deep_copy(base)
-    except (TypeError, ValueError):
-        result = dict(base)
+    result = _deep_copy(base)
 
     for key, value in overlay.items():
         if key in result and isinstance(result[key], dict) and isinstance(value, dict):
@@ -94,12 +93,15 @@ def merge_json_config(base: dict, overlay: dict) -> dict:
     return result
 
 
-def _deep_copy(obj):
-    """深拷贝辅助，使用 JSON 序列化避免共享可变状态。"""
+def _deep_copy(obj: Any) -> Any:
+    """深拷贝辅助，优先使用 copy.deepcopy，回退到 JSON 序列化。"""
     try:
-        return json.loads(json.dumps(obj))
-    except (TypeError, ValueError):
-        return obj
+        return copy.deepcopy(obj)
+    except Exception:
+        try:
+            return json.loads(json.dumps(obj))
+        except (TypeError, ValueError):
+            return obj
 
 
 def _is_hooks_list(lst: list) -> bool:

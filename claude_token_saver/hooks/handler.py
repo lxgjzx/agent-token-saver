@@ -168,6 +168,7 @@ def _safe_resolve_path(file_path: str) -> str | None:
     """安全规范化路径：防止路径遍历，只允许在工作目录范围内。"""
     if not file_path:
         return None
+    resolved = None
     try:
         resolved = Path(file_path).resolve()
         cwd = Path.cwd().resolve()

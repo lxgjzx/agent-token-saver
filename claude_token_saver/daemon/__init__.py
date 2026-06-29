@@ -11,13 +11,17 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
 import signal
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+import urllib.request
+from urllib.parse import parse_qs
 from datetime import datetime, timezone
 from typing import Any
 
@@ -41,9 +45,11 @@ API_TOKEN_FILE = DAEMON_DIR / ".api_token"  # API 认证 token 文件
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _setup_logger() -> logging.Logger:
-    DAEMON_DIR.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("claude_token_saver.daemon")
+    if logger.handlers:
+        return logger
     logger.setLevel(logging.DEBUG)
+    DAEMON_DIR.mkdir(parents=True, exist_ok=True)
 
     # 文件 handler（追加模式）
     fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
@@ -182,8 +188,8 @@ def _batch_record_events(events: list[dict[str, Any]]) -> None:
             e.get("cache_creation_tokens", 0) or 0,
             e.get("cache_read_tokens", 0) or 0,
             e.get("tool_name", ""),
-            e.get("tool_input", "")[:1000],
-            e.get("tool_output_preview", "")[:500],
+            (e.get("tool_input") or "")[:1000],
+            (e.get("tool_output_preview") or "")[:500],
             e.get("file_path", ""),
             e.get("cwd", ""),
             e.get("timestamp", ""),
@@ -333,6 +339,7 @@ def parse_transcript(file_path: Path) -> tuple[int, int]:
 
     parsed = 0
     skipped = 0
+    _BATCH_CHUNK = 500  # 每批最多写入事件数，控制内存
     batch: list[dict[str, Any]] = []
     try:
         with open(file_path, "r", encoding="utf-8", errors="replace") as f:
@@ -346,6 +353,9 @@ def parse_transcript(file_path: Path) -> tuple[int, int]:
                     event["source_file"] = str(file_path)
                     batch.append(event)
                     parsed += 1
+                    if len(batch) >= _BATCH_CHUNK:
+                        _batch_record_events(batch)
+                        batch = []
                 else:
                     skipped += 1
             new_offset = f.tell()
@@ -353,9 +363,12 @@ def parse_transcript(file_path: Path) -> tuple[int, int]:
         log.warning("读取文件失败 %s: %s", file_path, e)
         return (0, 0)
 
-    # 批量写入数据库
+    # 批量写入数据库（剩余未满批次的）
     if batch:
-        _batch_record_events(batch)
+        try:
+            _batch_record_events(batch)
+        except Exception as e:
+            log.error("写入事件失败 %s: %s", file_path, e)
 
     _update_scan_state(str(file_path), new_offset, mtime)
     return (parsed, skipped)
@@ -473,7 +486,6 @@ class _DaemonRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         # API Token 认证（支持 Authorization: Bearer 或 ?token= 查询参数）
-        from urllib.parse import parse_qs
         query_params = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
         query_token = query_params.get("token", [""])[0]
 
@@ -778,7 +790,6 @@ def _force_kill(pid: int) -> None:
     """强制终止进程（仅限本 daemon 启动的进程）。"""
     # 验证 PID 属于当前用户且属于本 daemon
     try:
-        import subprocess
         # 检查进程是否存在且属于当前用户
         result = subprocess.run(
             ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
@@ -814,7 +825,6 @@ _API_TOKEN_CACHE: str | None = None
 
 def _generate_api_token() -> str:
     """生成随机 API token 并保存到文件。"""
-    import secrets
     token = secrets.token_urlsafe(32)
     DAEMON_DIR.mkdir(parents=True, exist_ok=True)
     API_TOKEN_FILE.write_text(token, encoding="utf-8")
@@ -824,8 +834,7 @@ def _generate_api_token() -> str:
 
 
 def _invalidate_api_token_cache() -> None:
-    global _API_TOKEN_CACHE
-    _API_TOKEN_CACHE = None
+    _API_TOKEN_CACHE = None  # type: ignore[misc]
 
 
 def _get_api_token() -> str | None:
@@ -859,9 +868,11 @@ def _run_detached(
     http_port: int = HTTP_PORT,
 ) -> None:
     """在独立进程中运行 daemon（由 subprocess.Popen 调用）。"""
-    _setup_logger()  # 复用模块级日志配置
+    _setup_logger()  # 幂等：重复调用不添加重复 handler
     daemon = TokenDaemon(scan_interval=scan_interval, http_port=http_port)
-    daemon.start()
+    if not daemon.start():
+        log.warning("Daemon 启动失败（可能已在运行），退出")
+        return
     daemon.run_forever()
 
 
@@ -890,9 +901,6 @@ def start_daemon(
         return True
     else:
         # 后台模式：使用 subprocess 启动独立进程
-        import subprocess
-        import sys
-
         DAEMON_DIR.mkdir(parents=True, exist_ok=True)
 
         # 确保 API token 存在（子进程也会检查，但提前生成避免竞态）
@@ -1018,11 +1026,11 @@ def get_daemon_status() -> dict[str, Any]:
         try:
             api_token = _get_api_token()
             if api_token:
-                import urllib.request
-                req = urllib.request.urlopen(
-                    f"http://127.0.0.1:{HTTP_PORT}/status", timeout=2,
+                req_obj = urllib.request.Request(
+                    f"http://127.0.0.1:{HTTP_PORT}/status",
                     headers={"Authorization": f"Bearer {api_token}"},
                 )
+                req = urllib.request.urlopen(req_obj, timeout=2)
                 data = json.loads(req.read().decode("utf-8"))
                 result["uptime_seconds"] = data.get("uptime_seconds")
                 result["scanner_alive"] = data.get("scanner_alive")
