@@ -259,3 +259,88 @@ def format_symbol_index(symbols: list[dict[str, Any]], file_path: str) -> str:
     for s in symbols:
         lines.append(f"  {s['kind'][0].upper()} L{s['line']}: {s['signature']}")
     return "\n".join(lines)
+
+
+# ── 结构感知去重 ────────────────────────────────────────────────────────
+
+def structural_dedup(file_paths: list[str | Path], threshold: float = 0.85) -> list[str | Path]:
+    """基于代码结构相似度去重（超越 MD5 精确匹配）。
+
+    对每个文件提取骨架签名，将骨架完全相同的文件视为重复，
+    只保留第一个。这能捕获"同一个类模板生成的不同文件"这类 MD5 无法检测的重复。
+
+    Args:
+        file_paths: 文件路径列表
+        threshold: 骨架相似度阈值（0-1），>= 此值视为重复
+
+    Returns:
+        去重后的文件路径列表
+    """
+    from claude_token_saver.prep import _clear_caches
+
+    _clear_caches()
+
+    # 骨架签名 → 第一个文件路径
+    signature_map: dict[str, str | Path] = {}
+    unique: list[str | Path] = []
+    structural_dups = 0
+
+    for fp in file_paths:
+        fp = Path(fp)
+        if not fp.is_file():
+            unique.append(fp)
+            continue
+
+        try:
+            content = fp.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            unique.append(fp)
+            continue
+
+        ext = fp.suffix.lower()
+        skeleton = extract_skeleton(content, ext)
+
+        # 使用骨架的 MD5 作为结构签名
+        import hashlib
+        sig = hashlib.md5(skeleton.encode()).hexdigest()
+
+        if sig in signature_map:
+            # 结构重复，跳过
+            structural_dups += 1
+            continue
+
+        signature_map[sig] = fp
+        unique.append(fp)
+
+    if structural_dups > 0:
+        import logging
+        logging.getLogger("claude_token_saver.compressor").info(
+            "结构去重: 移除了 %d 个结构重复文件", structural_dups
+        )
+
+    return unique
+
+
+def group_by_structure(file_paths: list[str | Path]) -> list[list[str | Path]]:
+    """按代码结构分组文件，返回结构相同的组。"""
+    import hashlib
+    from collections import defaultdict
+
+    groups: dict[str, list[str | Path]] = defaultdict(list)
+
+    for fp in file_paths:
+        fp = Path(fp)
+        if not fp.is_file():
+            continue
+        try:
+            content = fp.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+
+        ext = fp.suffix.lower()
+        skeleton = extract_skeleton(content, ext)
+        sig = hashlib.md5(skeleton.encode()).hexdigest()
+        groups[sig].append(fp)
+
+    return list(groups.values())
+

@@ -9,8 +9,17 @@ from claude_token_saver.prep import (
     strip_comments, strip_python_docstrings, smart_truncate,
     deduplicate_files, compress_prompt, process_files, _clear_caches,
 )
-from claude_token_saver.compressor import extract_skeleton, extract_symbol_index, format_symbol_index
-from claude_token_saver.hooks.handler import _safe_resolve_path, _add_exclude_paths_to_input
+from claude_token_saver.compressor import (
+    extract_skeleton, extract_symbol_index, format_symbol_index,
+    structural_dedup, group_by_structure,
+)
+from claude_token_saver.hooks.handler import (
+    _safe_resolve_path, _add_exclude_paths_to_input,
+    _compress_tool_output,
+)
+from claude_token_saver.budget import auto_detail_level, estimate_auto_cost
+from claude_token_saver.compactor import ConversationCompactor, CompactedContext
+from claude_token_saver.prep import build_directory_index, format_index_for_prompt
 from claude_token_saver.sessions import SessionManager
 from claude_token_saver.config import load_config, save_config
 
@@ -458,3 +467,296 @@ class MyClass:
     def test_output_has_cache_hits_key(self, tmp_path):
         """返回字典应包含 cache_hits 键。"""
         assert "cache_hits" in process_files([], dedup=False)
+
+
+# ── 自适应 detail_level ────────────────────────────────────────────────
+
+class TestAutoDetailLevel:
+    def test_assigns_skeleton_for_large_files(self, tmp_path):
+        """超过预算 50% 的文件应分配 block，15-50% 分配 skeleton。"""
+        from claude_token_saver.budget import auto_detail_level
+        files = [
+            ("small.py", 500),
+            ("medium.py", 16_000),  # > 15% of 100K → skeleton
+            ("large.py", 200_000),
+        ]
+        levels = auto_detail_level(files, total_budget=100_000)
+        assert levels["large.py"] == "block"  # 200K > 50% of 100K → block
+        assert levels["medium.py"] == "skeleton"  # 16K > 15% of 100K → skeleton
+
+    def test_assigns_full_for_small_files(self, tmp_path):
+        """小文件应分配 full 级别。"""
+        from claude_token_saver.budget import auto_detail_level
+        files = [
+            ("tiny.py", 200),
+            ("small.py", 2_000),
+        ]
+        levels = auto_detail_level(files, total_budget=100_000)
+        assert levels["tiny.py"] == "full"
+        assert levels["small.py"] == "full"
+
+    def test_assigns_stripped_for_medium(self, tmp_path):
+        """中等文件应分配 stripped。"""
+        from claude_token_saver.budget import auto_detail_level
+        files = [
+            ("med.py", 20_000),
+        ]
+        levels = auto_detail_level(files, total_budget=100_000)
+        assert levels["med.py"] == "skeleton"  # >15% of budget
+
+    def test_block_when_exceeds_budget(self, tmp_path):
+        """超过总预算的文件应标记为 block。"""
+        from claude_token_saver.budget import auto_detail_level
+        files = [
+            ("huge.py", 200_000),
+        ]
+        levels = auto_detail_level(files, total_budget=100_000)
+        assert levels["huge.py"] == "block"
+
+    def test_auto_detail_in_process_files(self, tmp_path):
+        """process_files 应支持 auto_detail 模式。"""
+        _clear_caches()
+        # 创建大小不一的文件
+        small = tmp_path / "small.py"
+        small.write_text("x = 1\n")
+        large = tmp_path / "large.py"
+        large.write_text("x = " + "1\n" * 5000)
+
+        result = process_files(
+            [str(small), str(large)],
+            auto_detail=True,
+            token_budget=10_000,
+            dedup=False,
+        )
+        assert len(result["files"]) > 0
+        # 至少有一个文件被处理
+        assert result["total_tokens_before"] > 0
+
+    def test_estimate_auto_cost(self):
+        """estimate_auto_cost 应返回合理的估算。"""
+        from claude_token_saver.budget import estimate_auto_cost
+        files = [
+            ("a.py", 1000),
+            ("b.py", 50_000),
+            ("c.py", 200_000),
+        ]
+        est = estimate_auto_cost(files, total_budget=100_000)
+        assert est["total_before"] > 0
+        assert est["estimated_after"] < est["total_before"]
+        assert est["savings_pct"] > 0
+
+
+# ── 结构感知去重 ────────────────────────────────────────────────────────
+
+class TestStructuralDedup:
+    def test_dedup_identical_skeletons(self, tmp_path):
+        """骨架完全相同的文件应被视为重复。"""
+        from claude_token_saver.compressor import structural_dedup
+        f1 = tmp_path / "a.py"
+        f2 = tmp_path / "b.py"
+        code = '''import os\n\ndef foo():\n    return 1\n'''
+        f1.write_text(code)
+        f2.write_text(code)
+        result = structural_dedup([str(f1), str(f2)])
+        assert len(result) == 1
+
+    def test_keep_different_skeletons(self, tmp_path):
+        """骨架不同的文件应保留（不同的类/函数结构）。"""
+        from claude_token_saver.compressor import structural_dedup
+        f1 = tmp_path / "a.py"
+        f2 = tmp_path / "b.py"
+        # 不同的结构：一个有类，一个只有函数
+        f1.write_text("class Foo:\n    def method(self): pass\n")
+        f2.write_text("def bar(): pass\n")
+        result = structural_dedup([str(f1), str(f2)])
+        assert len(result) == 2
+
+    def test_same_different_names_deduped(self, tmp_path):
+        """骨架中函数名被保留，只有完全相同的代码才被去重。"""
+        from claude_token_saver.compressor import structural_dedup
+        f1 = tmp_path / "a.py"
+        f2 = tmp_path / "b.py"
+        # 完全相同的代码 → 骨架也相同
+        f1.write_text("def foo():\n    pass\n")
+        f2.write_text("def foo():\n    pass\n")
+        result = structural_dedup([str(f1), str(f2)])
+        assert len(result) == 1
+
+    def test_group_by_structure(self, tmp_path):
+        """group_by_structure 应将相同结构的文件分组。"""
+        from claude_token_saver.compressor import group_by_structure
+        f1 = tmp_path / "a.py"
+        f2 = tmp_path / "b.py"
+        f3 = tmp_path / "c.py"
+        # a 和 b 完全相同的骨架，c 不同
+        f1.write_text("def foo():\n    pass\n")
+        f2.write_text("def foo():\n    pass\n")  # 相同代码
+        f3.write_text("class Baz:\n    pass\n")
+        groups = group_by_structure([str(f1), str(f2), str(f3)])
+        assert len(groups) == 2
+        # 一个组有 2 个文件（a/b），另一个有 1 个（c）
+        sizes = sorted(len(g) for g in groups)
+        assert sizes == [1, 2]
+
+
+# ── 对话上下文压缩 ─────────────────────────────────────────────────────
+
+class TestConversationCompactor:
+    def test_should_compact_when_over_threshold(self):
+        """超过阈值应触发 compact。"""
+        from claude_token_saver.compactor import ConversationCompactor
+        c = ConversationCompactor()
+        assert c.should_compact("s1", 150_000, threshold=100_000)
+
+    def test_should_not_compact_below_threshold(self):
+        """低于阈值不应触发 compact。"""
+        from claude_token_saver.compactor import ConversationCompactor
+        c = ConversationCompactor()
+        assert not c.should_compact("s1", 50_000, threshold=100_000)
+
+    def test_compact_produces_summaries(self):
+        """compact 应将旧轮次压缩为摘要。"""
+        from claude_token_saver.compactor import ConversationCompactor
+        import tempfile, os
+        c = ConversationCompactor()
+        turns = [
+            {"turn_index": 1, "type": "user", "content": "Hello " * 100,
+             "tokens": 200, "timestamp": "2024-01-01T00:00:00"},
+            {"turn_index": 2, "type": "assistant", "content": "Hi there! " * 100,
+             "tokens": 200, "timestamp": "2024-01-01T00:01:00"},
+            {"turn_index": 3, "type": "user", "content": "Help me " * 100,
+             "tokens": 200, "timestamp": "2024-01-01T00:02:00"},
+        ]
+        result = c.compact("s1", turns, keep_recent=1)
+        assert len(result.summaries) == 2  # 旧 2 轮被压缩
+        assert len(result.recent_turns) == 1  # 最近 1 轮保留
+        assert result.total_tokens_after < result.total_tokens_before
+
+    def test_format_for_prompt(self):
+        """format_for_prompt 应生成可读的紧凑文本。"""
+        from claude_token_saver.compactor import ConversationCompactor, TurnSummary
+        c = ConversationCompactor()
+        ctx = CompactedContext(
+            session_id="s1",
+            original_turns=10,
+            compacted_turns=4,
+            summaries=[
+                TurnSummary(turn_index=1, turn_type="user",
+                           summary="Request summary", tokens_before=200, tokens_after=20),
+            ],
+            recent_turns=[{"turn_index": 10, "type": "user", "content": "last turn"}],
+            total_tokens_before=2000,
+            total_tokens_after=600,
+        )
+        text = c.format_for_prompt(ctx)
+        assert "对话摘要" in text
+        assert "轮次 1" in text
+        assert "最近" in text
+
+
+# ── 渐进式披露 ─────────────────────────────────────────────────────────
+
+class TestProgressiveDisclosure:
+    def test_build_directory_index(self, tmp_path):
+        """build_directory_index 应返回文件索引。"""
+        f = tmp_path / "main.py"
+        f.write_text("x = 1\n")
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        f2 = sub / "util.py"
+        f2.write_text("y = 2\n")
+
+        from claude_token_saver.prep import build_directory_index
+        idx = build_directory_index([str(tmp_path)])
+        assert idx["total_files"] == 2
+        assert idx["total_estimated_tokens"] > 0
+        assert len(idx["files"]) == 2
+
+    def test_index_does_not_read_content(self, tmp_path):
+        """索引模式不应读取文件内容。"""
+        import time
+        f = tmp_path / "slow.py"
+        # 写入一个标记，如果被读取就能检测到
+        f.write_text("# NOT_READ_MARKER\nx = 1\n")
+
+        from claude_token_saver.progressive import FileIndexEntry
+        entry = FileIndexEntry(
+            path=str(f),
+            size_bytes=f.stat().st_size,
+            estimated_tokens=10,
+            ext=".py",
+            relative_path="slow.py",
+        )
+        # 确认 entry 不包含文件内容
+        assert "NOT_READ_MARKER" not in str(entry.to_dict())
+
+    def test_format_index_markdown(self, tmp_path):
+        """Markdown 格式索引应包含目录结构。"""
+        f = tmp_path / "main.py"
+        f.write_text("x = 1\n")
+
+        from claude_token_saver.prep import build_directory_index, format_index_for_prompt
+        idx = build_directory_index([str(tmp_path)])
+        md = format_index_for_prompt(idx, format="markdown")
+        assert "项目目录索引" in md
+        assert "main.py" in md
+
+
+# ── 工具输出压缩 ────────────────────────────────────────────────────────
+
+class TestToolOutputCompression:
+    def test_grep_context_limited(self):
+        """Grep 输出应限制上下文行数。"""
+        from claude_token_saver.hooks.handler import _compress_tool_output
+        output = {
+            "matches": [
+                {
+                    "file": "test.py",
+                    "line": 10,
+                    "content": "def foo():",
+                    "context": [f"line {i}" for i in range(20)],
+                }
+            ]
+        }
+        result = _compress_tool_output("Grep", {}, output)
+        assert len(result["matches"][0]["context"]) <= 5  # 匹配行 + 前后各 2
+        assert result["matches"][0].get("context_truncated") is True
+
+    def test_grep_short_context_unchanged(self):
+        """短上下文不应被截断。"""
+        from claude_token_saver.hooks.handler import _compress_tool_output
+        output = {
+            "matches": [
+                {
+                    "file": "test.py",
+                    "line": 5,
+                    "content": "def bar():",
+                    "context": ["line 3", "line 4", "def bar():", "line 6"],
+                }
+            ]
+        }
+        result = _compress_tool_output("Grep", {}, output)
+        assert len(result["matches"][0]["context"]) == 4
+        assert "context_truncated" not in result["matches"][0]
+
+    def test_glob_truncated_when_many(self):
+        """Glob 结果过多时应截断。"""
+        from claude_token_saver.hooks.handler import _compress_tool_output
+        output = {
+            "results": [
+                {"path": f"file{i}.py", "content": "x" * 500}
+                for i in range(50)
+            ]
+        }
+        result = _compress_tool_output("Glob", {}, output)
+        assert result.get("truncated") is True
+        assert result.get("total_results") == 50
+        # 内容预览应被移除
+        assert "content" not in result["results"][0]
+
+    def test_non_target_tool_unchanged(self):
+        """非 Grep/Glob 工具的输出不应被修改。"""
+        from claude_token_saver.hooks.handler import _compress_tool_output
+        output = {"result": "some output"}
+        result = _compress_tool_output("Read", {}, output)
+        assert result is output

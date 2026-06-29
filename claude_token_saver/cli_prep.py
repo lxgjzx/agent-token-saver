@@ -26,11 +26,18 @@ def prep() -> None:
 @click.option("--strip-docstrings", is_flag=True, help="去除 Python 文档字符串")
 @click.option("--no-dedup", is_flag=True, help="不去重")
 @click.option("--max-tokens", type=int, default=50_000, help="单文件最大 token 数")
-@click.option("--detail-level", type=click.Choice(["skeleton", "stripped", "full", "block"]), default="full", help="压缩级别: skeleton(5-10%%), stripped(30-50%%), full, block(阻止超大文件)")
+@click.option("--detail-level", type=click.Choice(["skeleton", "stripped", "full", "block"]), default="full", help="压缩级别")
 @click.option("--no-cache", is_flag=True, help="禁用文件缓存（强制重新处理）")
 @click.option("--dry-run", is_flag=True, help="仅显示统计，不输出内容")
 @click.option("--include-binary", is_flag=True, help="包含二进制文件")
 @click.option("-v", "--verbose", is_flag=True, help="显示详细信息")
+# 新增：自适应 detail_level
+@click.option("--auto-detail", is_flag=True, help="根据 token 预算自动分配压缩级别")
+@click.option("--token-budget", type=int, default=50_000, help="token 预算（--auto-detail 时使用）")
+# 新增：结构去重
+@click.option("--structural-dedup", is_flag=True, help="基于代码结构相似度去重（超越 MD5）")
+# 新增：渐进式披露（目录索引模式）
+@click.option("--index", is_flag=True, help="仅输出目录索引（不读取文件内容）")
 def prep_files(
     paths: tuple[str],
     output: str | None,
@@ -44,6 +51,10 @@ def prep_files(
     dry_run: bool,
     include_binary: bool,
     verbose: bool,
+    auto_detail: bool,
+    token_budget: int,
+    structural_dedup: bool,
+    index: bool,
 ) -> None:
     """处理文件列表，输出精简后的内容。
 
@@ -52,6 +63,11 @@ def prep_files(
       stripped - 去除注释和 docstring（~30-50%% token）
       full     - 完整内容（默认）
       block    - 阻止读取超大文件（不读取内容）
+
+    新增模式:
+      --auto-detail --token-budget N  根据预算自动分配压缩级别
+      --structural-dedup              基于代码结构去重
+      --index                         仅输出目录索引（渐进式披露）
     """
     config = load_config()
     file_paths = list(paths)
@@ -71,6 +87,36 @@ def prep_files(
         click.echo("⚠️  没有找到可处理的文件", err=True)
         sys.exit(1)
 
+    # ── 渐进式披露：目录索引模式 ─────────────────────────────────────────
+    if index:
+        click.echo(f"📂 构建目录索引（{len(expanded)} 个路径）...")
+        from claude_token_saver.prep import build_directory_index, format_index_for_prompt
+        idx = build_directory_index(expanded, include_binary=include_binary)
+        click.echo(f"   索引文件: {idx['total_files']} 个")
+        click.echo(f"   估计 token: {idx['total_estimated_tokens']:,}")
+        output_text = format_index_for_prompt(idx, format=format)
+        if output:
+            __import__("pathlib").Path(output).write_text(output_text, encoding="utf-8")
+            click.echo(f"\n✅ 索引已保存到: {output}")
+        else:
+            click.echo(f"\n{'=' * 60}")
+            click.echo(output_text)
+        return
+
+    # ── 自动 compact 检查 ────────────────────────────────────────────────
+    if auto_detail:
+        click.echo(f"💰 自适应模式（预算: {token_budget:,} tokens）")
+
+    # ── 结构去重 ─────────────────────────────────────────────────────────
+    if structural_dedup:
+        click.echo("🔍 结构去重中...")
+        from claude_token_saver.compressor import structural_dedup as _sd
+        before = len(expanded)
+        expanded = [str(p) for p in _sd([__import__("pathlib").Path(p) for p in expanded])]
+        dup_count = before - len(expanded)
+        if dup_count:
+            click.echo(f"   结构重复: {dup_count} 个文件已去重")
+
     result = process_files(
         expanded,
         do_strip_comments=not no_strip_comments,
@@ -80,10 +126,14 @@ def prep_files(
         include_binary=include_binary,
         detail_level=detail_level,
         token_cache_enabled=not no_cache,
+        auto_detail=auto_detail,
+        token_budget=token_budget,
+        structural_dedup=False,  # 已在上方处理
     )
 
     # 输出统计
-    click.echo(f"📊 处理结果（级别: {detail_level}）：")
+    effective_level = "auto" if auto_detail else detail_level
+    click.echo(f"📊 处理结果（级别: {effective_level}）：")
     click.echo(f"   文件数: {len(result['files'])}")
     if result.get("cache_hits"):
         click.echo(f"   缓存命中: {result['cache_hits']} 个文件（跳过重新处理）")
@@ -95,12 +145,13 @@ def prep_files(
                f"({result['savings_pct']}% 节省)")
 
     if verbose and result["files"]:
-        click.echo(f"\n📁 各文件节省情况（detail={detail_level}）：")
-        click.echo(f"   {'文件':<50} {'压缩前':>10} {'压缩后':>10} {'节省':>10}")
+        click.echo(f"\n📁 各文件节省情况：")
+        click.echo(f"   {'文件':<50} {'级别':<10} {'压缩前':>10} {'压缩后':>10} {'节省':>10}")
         click.echo(f"   {'─' * 50} {'─' * 10} {'─' * 10} {'─' * 10}")
         for f in result["files"]:
+            lvl = f.get("detail_level", detail_level)
             savings_pct = (f["savings"] / f["tokens_before"] * 100) if f["tokens_before"] else 0
-            click.echo(f"   {str(f['path']):<50} {f['tokens_before']:>10,} {f['tokens_after']:>10,} "
+            click.echo(f"   {str(f['path']):<50} {lvl:<10} {f['tokens_before']:>10,} {f['tokens_after']:>10,} "
                        f"{savings_pct:>9.0f}%")
 
     if dry_run:

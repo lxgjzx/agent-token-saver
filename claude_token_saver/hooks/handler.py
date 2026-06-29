@@ -311,7 +311,96 @@ def handle_post_tool(
 
     _record_tool_usage(tool_name, tool_input, tool_output, safe_path, file_size, "approve", session_id)
 
+    # ── 工具输出压缩 ─────────────────────────────────────────────────────
+    compressed_output = _compress_tool_output(tool_name, tool_input, tool_output)
+    if compressed_output is not tool_output:
+        return {"decision": "approve", "reason": "", "modified_output": compressed_output}
+
     return {"decision": "approve", "reason": ""}
+
+
+# ── 工具输出压缩 ────────────────────────────────────────────────────────
+
+# Grep 单次匹配最大上下文行数
+DEFAULT_GREP_CONTEXT_LINES: int = 2
+
+# Glob 结果最大展示数（超出后只列路径）
+DEFAULT_GLOB_DISPLAY_LIMIT: int = 30
+
+
+def _compress_tool_output(
+    tool_name: str,
+    tool_input: dict,
+    tool_output: dict,
+) -> dict:
+    """压缩工具输出，减少返回给 Claude 的 token。
+
+    - Grep: 限制每匹配的上下文行数（默认 2 行）
+    - Glob: 结果过多时只返回路径列表，省略文件预览
+    """
+    if tool_name == "Grep":
+        return _compress_grep_output(tool_output)
+    elif tool_name == "Glob":
+        return _compress_glob_output(tool_output)
+    return tool_output
+
+
+def _compress_grep_output(output: dict) -> dict:
+    """压缩 Grep 输出：限制上下文行数。"""
+    if not isinstance(output, dict):
+        return output
+
+    matches = output.get("matches", [])
+    if not isinstance(matches, list):
+        return output
+
+    max_context = DEFAULT_GREP_CONTEXT_LINES
+    compressed = []
+    for match in matches:
+        if not isinstance(match, dict):
+            compressed.append(match)
+            continue
+        compressed_match = dict(match)
+        context = match.get("context", [])
+        if isinstance(context, list) and len(context) > max_context * 2 + 1:
+            # 保留匹配行 + 前后各 N 行
+            center = len(context) // 2
+            start = max(0, center - max_context)
+            end = min(len(context), center + max_context + 1)
+            compressed_match["context"] = context[start:end]
+            compressed_match["context_truncated"] = True
+        compressed.append(compressed_match)
+
+    result = dict(output)
+    result["matches"] = compressed
+    return result
+
+
+def _compress_glob_output(output: dict) -> dict:
+    """压缩 Glob 输出：结果过多时省略内容预览。"""
+    if not isinstance(output, dict):
+        return output
+
+    results = output.get("results", [])
+    if not isinstance(results, list):
+        return output
+
+    if len(results) > DEFAULT_GLOB_DISPLAY_LIMIT:
+        # 只保留路径，移除大文件的内容预览
+        compressed = []
+        for r in results:
+            if not isinstance(r, dict):
+                compressed.append(r)
+                continue
+            cr = {k: v for k, v in r.items() if k in ("path", "is_dir", "size")}
+            compressed.append(cr)
+        result = dict(output)
+        result["results"] = compressed
+        result["truncated"] = True
+        result["total_results"] = len(results)
+        return result
+
+    return output
 
 
 # ── 主入口 ────────────────────────────────────────────────────────────

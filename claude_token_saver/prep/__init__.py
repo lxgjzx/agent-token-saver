@@ -70,6 +70,18 @@ def _cache_key(path: Path, content: str) -> tuple:
         return (str(path.resolve()), 0, len(content))
 
 
+def estimate_tokens_from_size(size_bytes: int, ext: str) -> int:
+    """根据文件大小和扩展名快速估算 token 数量（不读取内容）。"""
+    ext = ext.lower()
+    if ext in {".json", ".yaml", ".yml", ".toml"}:
+        ratio = 0.15
+    elif ext in {".md", ".txt", ".rst"}:
+        ratio = 0.12
+    else:
+        ratio = 0.125
+    return max(1, int(size_bytes * ratio))
+
+
 def _clear_caches() -> None:
     """清空所有缓存（用于测试或内存压力时）。"""
     _content_cache.clear()
@@ -323,6 +335,9 @@ def process_files(
     include_binary: bool = False,
     detail_level: str = "full",
     token_cache_enabled: bool = True,
+    auto_detail: bool = False,
+    token_budget: int | None = None,
+    structural_dedup: bool = False,
 ) -> dict:
     """
     处理文件列表，返回精简后的结果。
@@ -332,6 +347,10 @@ def process_files(
       - "stripped": 去除注释和 docstring，~30-50% token
       - "full": 完整内容（默认）
       - "block": 对超大文件返回阻止标记，不读取内容
+
+    auto_detail: 根据 token_budget 自动为每个文件分配最优 detail_level
+
+    structural_dedup: 基于代码结构相似度去重（超越 MD5）
 
     Returns:
         {
@@ -344,8 +363,37 @@ def process_files(
             "cache_hits": int,
         }
     """
-    if dedup:
+    # ── 结构去重 ────────────────────────────────────────────────────────
+    if structural_dedup:
+        file_paths = list(file_paths)
+        from claude_token_saver.compressor import structural_dedup as _structural_dedup
+        file_paths = _structural_dedup(file_paths)
+        # 重置去重计数器（MD5 去重不再需要）
+        md5_dedup = dedup
+        dedup = False
+    else:
+        md5_dedup = dedup
+
+    if md5_dedup:
         file_paths = deduplicate_files(list(file_paths))
+
+    # ── 自适应 detail_level ─────────────────────────────────────────────
+    per_file_levels: dict[str, str] = {}
+    if auto_detail:
+        budget = token_budget or 50_000
+        file_token_list: list[tuple[str, int]] = []
+        for fp in file_paths:
+            fp_path = Path(fp)
+            if fp_path.is_file() and not should_ignore(fp_path, include_binary=include_binary):
+                try:
+                    size = fp_path.stat().st_size
+                    tokens = estimate_tokens_from_size(size, fp_path.suffix)
+                    file_token_list.append((str(fp), tokens))
+                except OSError:
+                    pass
+
+        from claude_token_saver.budget import auto_detail_level
+        per_file_levels = auto_detail_level(file_token_list, budget)
 
     results = []
     total_before = 0
@@ -356,39 +404,47 @@ def process_files(
     seen_hashes: set[str] = set()
 
     for fp in file_paths:
-        fp = Path(fp)
-        if should_ignore(fp, include_binary=include_binary):
-            skipped.append(str(fp))
+        fp_path = Path(fp)
+        if should_ignore(fp_path, include_binary=include_binary):
+            skipped.append(str(fp_path))
             continue
 
         try:
-            if is_binary_file(fp):
-                skipped.append(f"{fp} (binary)")
+            if is_binary_file(fp_path):
+                skipped.append(f"{fp_path} (binary)")
                 continue
+
+            # 自适应 detail_level 决定
+            if auto_detail and str(fp) in per_file_levels:
+                detail_level = per_file_levels[str(fp)]
+                if detail_level == "block":
+                    skipped.append(f"{fp_path} (超出预算，建议 --offset/--limit)")
+                    continue
 
             # 缓存检查：跳过未更改的文件
             cache_key = None
             if token_cache_enabled:
-                cache_key = _cache_key(fp, "")
+                cache_key = _cache_key(fp_path, "")
                 if cache_key in _content_cache:
                     cached_hash, cached_tokens = _content_cache[cache_key]
                     if detail_level == "full":
-                        content = fp.read_text(encoding="utf-8", errors="replace")
+                        content = fp_path.read_text(encoding="utf-8", errors="replace")
                         content_hash = hashlib.md5(content.encode()).hexdigest()
                         if content_hash == cached_hash:
                             total_before += cached_tokens
                             total_after += cached_tokens
                             results.append({
-                                "path": str(fp),
+                                "path": str(fp_path),
                                 "tokens_before": cached_tokens,
                                 "tokens_after": cached_tokens,
                                 "savings": 0,
                                 "content": content,
+                                "detail_level": "full (cached)",
                             })
                             cache_hits += 1
                             continue
 
-            content = fp.read_text(encoding="utf-8", errors="replace")
+            content = fp_path.read_text(encoding="utf-8", errors="replace")
             tokens_before = count_tokens(content)
             total_before += tokens_before
 
@@ -405,22 +461,23 @@ def process_files(
 
             # detail_level 路由
             if detail_level == "block" and tokens_before > max_file_tokens:
-                skipped.append(f"{fp} (too large: {tokens_before} tokens, use --offset/--limit)")
+                skipped.append(f"{fp_path} (too large: {tokens_before} tokens, use --offset/--limit)")
                 continue
 
             processed_content = _process_content(
-                content, fp, detail_level, do_strip_comments, do_strip_docstrings, max_file_tokens
+                content, fp_path, detail_level, do_strip_comments, do_strip_docstrings, max_file_tokens
             )
 
             tokens_after = count_tokens(processed_content)
             total_after += tokens_after
 
             results.append({
-                "path": str(fp),
+                "path": str(fp_path),
                 "tokens_before": tokens_before,
                 "tokens_after": tokens_after,
                 "savings": tokens_before - tokens_after,
                 "content": processed_content,
+                "detail_level": detail_level,
             })
         except Exception as e:
             import logging
@@ -506,3 +563,96 @@ def format_processed_output(result: dict, format: str = "markdown") -> str:
         return json.dumps(result, ensure_ascii=False, indent=2)
     else:
         raise ValueError(f"Unknown format: {format}")
+
+
+# ── 渐进式披露 ────────────────────────────────────────────────────────────
+
+def build_directory_index(
+    paths: list[str | Path],
+    max_files: int = 200,
+    include_binary: bool = False,
+) -> dict:
+    """构建目录索引（不读取文件内容，只返回大小和路径）。
+
+    用于渐进式披露：先给 Claude 一个目录骨架，按需读取具体文件。
+    适合大项目（>30 个文件）的场景。
+
+    Returns:
+        {
+            "root": str,
+            "total_files": int,
+            "total_estimated_tokens": int,
+            "files": [{"path", "relative", "size_kb", "tokens", "ext"}, ...],
+            "by_directory": {"dir": [...], ...},
+            "largest_files": [...],
+        }
+    """
+    from claude_token_saver.progressive import build_directory_index as _build_index
+    index = _build_index(paths, max_files=max_files, include_binary=include_binary)
+    return {
+        "root": index.root,
+        "total_files": index.total_files,
+        "total_estimated_tokens": index.total_tokens,
+        "files": [e.to_dict() for e in index.files],
+        "by_directory": {
+            d: [e.to_dict() for e in entries]
+            for d, entries in index.by_directory.items()
+        },
+        "largest_files": [e.to_dict() for e in index.largest_files],
+    }
+
+
+def format_index_for_prompt(index_data: dict, format: str = "markdown") -> str:
+    """将目录索引格式化为可注入 Claude prompt 的文本。"""
+    from claude_token_saver.progressive import format_index_markdown, format_index_json
+    if format == "markdown":
+        # 从 dict 数据重建 DirectoryIndex 对象
+        from claude_token_saver.progressive import DirectoryIndex, FileIndexEntry
+
+        def _entry_from_dict(e: dict) -> FileIndexEntry:
+            size_kb = e.get("size_kb", 0)
+            size_bytes = int(size_kb * 1024) if size_kb else e.get("size_bytes", 0)
+            return FileIndexEntry(
+                path=e["path"],
+                size_bytes=size_bytes,
+                estimated_tokens=e["tokens"],
+                ext=e.get("ext", ""),
+                relative_path=e.get("relative", ""),
+            )
+
+        files = [_entry_from_dict(e) for e in index_data.get("files", [])]
+        by_dir = {}
+        for d, entries in index_data.get("by_directory", {}).items():
+            by_dir[d] = [_entry_from_dict(e) for e in entries]
+
+        idx = DirectoryIndex(
+            root=index_data.get("root", ""),
+            total_files=index_data.get("total_files", 0),
+            total_tokens=index_data.get("total_estimated_tokens", 0),
+            files=files,
+            by_directory=by_dir,
+            largest_files=[],
+        )
+        return format_index_markdown(idx)
+    elif format == "json":
+        from claude_token_saver.progressive import format_index_json, DirectoryIndex
+        idx = DirectoryIndex(
+            root=index_data.get("root", ""),
+            total_files=index_data.get("total_files", 0),
+            total_tokens=index_data.get("total_estimated_tokens", 0),
+            files=[],
+            by_directory={},
+            largest_files=[],
+        )
+        return format_index_json(idx)
+    # fallback
+    from claude_token_saver.progressive import format_index_markdown, DirectoryIndex
+    idx = DirectoryIndex(
+        root=index_data.get("root", ""),
+        total_files=index_data.get("total_files", 0),
+        total_tokens=index_data.get("total_estimated_tokens", 0),
+        files=[],
+        by_directory={},
+        largest_files=[],
+    )
+    return format_index_markdown(idx)

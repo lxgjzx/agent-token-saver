@@ -4,6 +4,7 @@ sessions 子命令 - 会话管理
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 import click
 
@@ -101,6 +102,78 @@ def sessions_compact_log(session_id: str, tokens_before: int, tokens_after: int)
     mgr.update_session(session_id, compacted=True)
     click.echo(f"✅ 已记录 compact: {tokens_before:,} → {tokens_after:,} (节省 {saved:,} tokens, "
                f"{saved / tokens_before * 100:.1f}%)")
+
+
+@sessions.command("auto-compact")
+@click.option("--threshold", type=int, default=None, help="compact 阈值（默认使用配置文件值）")
+@click.option("--keep", type=int, default=5, help="保留最近几轮完整内容")
+@click.option("--dry-run", is_flag=True, help="仅显示建议，不执行 compact")
+def sessions_auto_compact(threshold: int | None, keep: int, dry_run: bool) -> None:
+    """自动检测并 compact 过大的会话。"""
+    from claude_token_saver.config import load_config
+    from claude_token_saver.compactor import ConversationCompactor
+
+    config = load_config()
+    threshold = threshold or config.get("auto_compact_threshold", 100_000)
+
+    mgr = SessionManager()
+    compactor = ConversationCompactor()
+
+    sessions = mgr.list_sessions()
+    candidates = [s for s in sessions if compactor.should_compact(s.id, s.tokens_used, threshold)]
+
+    if not candidates:
+        click.echo("✅ 没有需要 compact 的会话")
+        return
+
+    click.echo(click.style(f"🔍 发现 {len(candidates)} 个需要 compact 的会话（阈值: {threshold:,} tokens）\n", fg="yellow"))
+
+    for s in candidates:
+        saved = s.tokens_used - int(s.tokens_used * 0.3)
+        click.echo(f"   {s.id:<10} {s.title[:28]:<30} {s.tokens_used:>12,} tokens")
+        click.echo(f"              预估节省: ~{saved:,} tokens ({saved / s.tokens_used * 100:.0f}%)")
+
+    if dry_run:
+        click.echo("\n（dry-run 模式，未执行 compact）")
+        return
+
+    if not click.confirm(f"\n确定 compact 这 {len(candidates)} 个会话？"):
+        return
+
+    for s in candidates:
+        # 构造模拟 turn 数据（从 transcript 恢复）
+        from claude_token_saver.transcript import TranscriptParser
+        parser = TranscriptParser()
+        session_file = Path.home() / ".claude" / "projects" / f"{s.id}.jsonl"
+        turns: list[dict] = []
+        if session_file.exists():
+            try:
+                _, parsed_turns = parser.parse_file(session_file)
+                turns = [
+                    {
+                        "turn_index": t.turn_index,
+                        "type": t.type,
+                        "content": t.content,
+                        "tokens": t.total_tokens,
+                        "timestamp": t.timestamp,
+                        "tool_uses": [
+                            {"name": tu.name, "result_content": tu.result_content}
+                            for tu in t.tool_uses
+                        ],
+                    }
+                    for t in parsed_turns
+                ]
+            except Exception:
+                pass
+
+        if not turns:
+            click.echo(f"   ⚠️  会话 {s.id} 无法恢复对话历史，跳过")
+            continue
+
+        result = compactor.compact(s.id, turns, keep_recent=keep)
+        formatted = compactor.format_for_prompt(result)
+        click.echo(f"   ✅ {s.id}: {result.total_tokens_before:,} → {result.total_tokens_after:,} "
+                   f"({result.total_tokens_before - result.total_tokens_after:,} tokens 已压缩)")
 
 
 @sessions.command("delete")

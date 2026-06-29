@@ -15,10 +15,13 @@ DEFAULT_CONFIG: dict = {
     "model": "claude-sonnet-4-20250514",
     "auto_compact_threshold": 100_000,  # token 数
     "compact_keep_ratio": 0.3,  # 保留最近 30%
+    "compact_keep_recent": 5,  # 保留最近 N 轮完整内容
     "strip_comments": True,
     "strip_docstrings": False,
     "max_file_tokens": 50_000,
     "max_total_tokens": 200_000,
+    "auto_detail_default": False,  # 是否默认启用自适应 detail_level
+    "structural_dedup_default": False,  # 是否默认启用结构去重
     "ignore_dirs": sorted({
         ".git", ".svn", ".hg", "__pycache__", "node_modules",
         ".venv", "venv", "dist", "build", ".idea", ".vscode",
