@@ -1,5 +1,5 @@
 """
-Claude Code Token Saver - Hook Handler
+Agent Token Saver - Hook Handler
 处理 Claude Code 的 PreToolUse 和 PostToolUse hooks。
 
 从 stdin 读取 JSON 事件，输出 JSON 决策到 stdout，警告输出到 stderr。
@@ -10,16 +10,19 @@ Token 节省策略：
   - Glob 结果数量限制（注入 maxResults=100）
   - Grep 结果数量限制（注入 maxMatches=50）
   - 目录排除注入（自动排除 node_modules/.venv/.git 等）
+  - Read 结果去重（同一文件短时间重复读取时引用已有结果）
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import sqlite3
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
-from claude_token_saver.utils import get_file_size
+from claude_token_saver.utils import count_tokens, get_file_size
 
 # ── 常量 ──────────────────────────────────────────────────────────────
 
@@ -36,7 +39,7 @@ DEFAULT_GLOB_MAX_RESULTS: int = 100
 DEFAULT_GREP_MAX_MATCHES: int = 50
 
 # 分析数据库路径
-ANALYTICS_DB: Path = Path.home() / ".claude-token-saver" / "analytics.db"
+ANALYTICS_DB: Path = Path.home() / ".agent-token-saver" / "analytics.db"
 
 # 默认排除目录
 DEFAULT_EXCLUDE_DIRS: set[str] = {
@@ -50,8 +53,23 @@ DEFAULT_EXCLUDE_FILES: set[str] = {
     ".DS_Store", "Thumbs.db",
 }
 
+# 预计算的排除模式（避免每次 hook 调用时重建）
+_GLOB_DEFAULT_EXCLUDES: list[str] = sorted(DEFAULT_EXCLUDE_DIRS)
+_GREP_EXCLUDE_PATTERNS: list[str] = (
+    [f"*/{d}/**" for d in sorted(DEFAULT_EXCLUDE_DIRS)]
+    + [f"**/{f}" for f in sorted(DEFAULT_EXCLUDE_FILES)]
+)
+_GREP_EXCLUDE_STRING: str = "|".join(_GREP_EXCLUDE_PATTERNS)
+
+# Read 结果去重缓存：file_path -> (content_hash, token_count, mtime)
+_READ_CACHE: dict[str, tuple[str, int, float]] = {}
+
 
 # ── 数据库操作 ────────────────────────────────────────────────────────
+
+def _utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
 
 def _init_db(db_path: Path) -> None:
     """初始化 tool_usage 和 waste_log 表（如不存在）。"""
@@ -99,7 +117,7 @@ def _record_security_event(event_type: str, description: str, details: str = "")
     conn = sqlite3.connect(ANALYTICS_DB)
     conn.execute(
         "INSERT INTO security_log (event_type, description, details, timestamp) VALUES (?, ?, ?, ?)",
-        (event_type, description, details, datetime.now().isoformat()),
+        (event_type, description, details, _utcnow()),
     )
     conn.commit()
     conn.close()
@@ -129,11 +147,72 @@ def _record_tool_usage(
             file_size,
             decision,
             session_id,
-            datetime.now().isoformat(),
+            _utcnow(),
         ),
     )
     conn.commit()
     conn.close()
+
+
+# ── Read 结果去重 ──────────────────────────────────────────────────────
+
+def _get_read_cache_key(file_path: str) -> str:
+    """生成 Read 缓存的键。"""
+    return file_path
+
+
+def _get_file_content_hash(file_path: str) -> str | None:
+    """计算文件内容的 MD5 hash（统一换行符，确保跨平台一致性）。"""
+    try:
+        # newline=None 启用 universal newlines 模式，自动将 \r\n → \n
+        with open(file_path, "r", encoding="utf-8", errors="replace", newline=None) as f:
+            content = f.read()
+        return hashlib.md5(content.encode()).hexdigest()
+    except Exception:
+        return None
+
+
+def _check_read_cache(file_path: str) -> tuple[bool, int]:
+    """检查 Read 缓存：返回 (是否命中, token_count)。"""
+    import os
+    key = _get_read_cache_key(file_path)
+    if key not in _READ_CACHE:
+        return False, 0
+    cached_hash, cached_tokens, cached_mtime = _READ_CACHE[key]
+    # 快速路径：检查 mtime（无需读取文件内容）
+    try:
+        current_mtime = os.path.getmtime(file_path)
+        if current_mtime == cached_mtime:
+            return True, cached_tokens
+    except OSError:
+        pass
+    # mtime 变化：回退到完整内容 hash 检查
+    current_hash = _get_file_content_hash(file_path)
+    if current_hash is None or current_hash != cached_hash:
+        return False, 0
+    # mtime 变了但内容没变（如 touch 操作），更新缓存
+    try:
+        _READ_CACHE[key] = (current_hash, cached_tokens, os.path.getmtime(file_path))
+    except OSError:
+        pass
+    return True, cached_tokens
+
+
+def _update_read_cache(file_path: str, content: str) -> None:
+    """更新 Read 缓存。"""
+    import os
+    try:
+        content_hash = hashlib.md5(content.encode()).hexdigest()
+        tokens = count_tokens(content)
+        mtime = os.path.getmtime(file_path)
+        _READ_CACHE[file_path] = (content_hash, tokens, mtime)
+    except Exception:
+        pass
+
+
+def clear_read_cache() -> None:
+    """清空 Read 缓存。"""
+    _READ_CACHE.clear()
 
 
 # ── 工具函数 ──────────────────────────────────────────────────────────
@@ -142,7 +221,7 @@ def _warn_large_file(file_path: str, file_size: int) -> str:
     """生成大文件警告文本。"""
     size_kb = file_size / 1024
     return (
-        f"[claude-token-saver] 文件过大 ({size_kb:.0f} KB)，"
+        f"[ats] 文件过大 ({size_kb:.0f} KB)，"
         f"建议使用 --offset 和 --limit 参数只读取需要的部分。"
     )
 
@@ -156,7 +235,7 @@ def _add_exclude_paths_to_input(tool_input: dict, tool_name: str) -> dict:
         existing_excludes = modified.get("excludeDirs", [])
         if isinstance(existing_excludes, list):
             new_excludes = list(existing_excludes)
-            for d in DEFAULT_EXCLUDE_DIRS:
+            for d in _GLOB_DEFAULT_EXCLUDES:
                 if d not in new_excludes:
                     new_excludes.append(d)
             modified["excludeDirs"] = new_excludes
@@ -167,15 +246,11 @@ def _add_exclude_paths_to_input(tool_input: dict, tool_name: str) -> dict:
 
     elif tool_name == "Grep":
         # Grep 工具支持 exclude 参数（管道分隔的 glob 模式）
-        exclude_patterns = [f"*/{d}/**" for d in sorted(DEFAULT_EXCLUDE_DIRS)]
-        for f in sorted(DEFAULT_EXCLUDE_FILES):
-            exclude_patterns.append(f"**/{f}")
-
         existing_exclude = modified.get("exclude", "")
         if existing_exclude:
-            modified["exclude"] = existing_exclude + "|" + "|".join(exclude_patterns)
+            modified["exclude"] = existing_exclude + "|" + _GREP_EXCLUDE_STRING
         else:
-            modified["exclude"] = "|".join(exclude_patterns)
+            modified["exclude"] = _GREP_EXCLUDE_STRING
 
         # 限制匹配数量（如果未设置）
         if "maxMatches" not in modified:
@@ -238,12 +313,21 @@ def handle_pre_tool(tool_name: str, tool_input: dict, session_id: str | None = N
                         # 超大文件：询问用户是否继续
                         decision = "ask"
                         reason = (
-                            f"[claude-token-saver] 文件过大 ({file_size / 1024:.0f} KB)，"
+                            f"[ats] 文件过大 ({file_size / 1024:.0f} KB)，"
                             f"建议使用 --offset 和 --limit 参数只读取需要的部分。是否继续？"
                         )
                     elif file_size > DEFAULT_MAX_FILE_SIZE_BYTES:
                         # 大文件：警告但允许
                         reason = _warn_large_file(safe_path, file_size)
+
+                    # Read 结果去重：文件未变更时提示 Claude 使用上次结果
+                    if decision == "approve" and not reason:
+                        cache_hit, cached_tokens = _check_read_cache(safe_path)
+                        if cache_hit:
+                            reason = (
+                                f"[ats] 此文件内容未变更（上次读取 {cached_tokens:,} tokens），"
+                                f"可复用之前的结果，无需重新读取。"
+                            )
                 except OSError:
                     pass
         file_path = safe_path or ""
@@ -259,6 +343,14 @@ def handle_pre_tool(tool_name: str, tool_input: dict, session_id: str | None = N
         result["modified_input"] = modified_input
 
     _record_tool_usage(tool_name, tool_input, None, file_path, file_size, decision, session_id)
+
+    # 压缩 reason 文本以减少 token 消耗
+    try:
+        if result.get("reason"):
+            from claude_token_saver.hook_optimizer import compress_reason_text
+            result["reason"] = compress_reason_text(result["reason"])
+    except Exception:
+        pass
 
     return result
 
@@ -303,13 +395,31 @@ def handle_post_tool(
                 f"读取大文件: {safe_path} ({file_size / 1024:.1f} KB)",
                 tokens_wasted,
                 "使用 --offset 和 --limit 参数只读取需要的部分",
-                datetime.now().isoformat(),
+                _utcnow(),
             ),
         )
         conn.commit()
         conn.close()
 
     _record_tool_usage(tool_name, tool_input, tool_output, safe_path, file_size, "approve", session_id)
+
+    # ── Read 结果缓存更新 ─────────────────────────────────────────────────
+    if tool_name == "Read" and safe_path:
+        try:
+            # 优先使用 tool_output 中的内容，避免重复 I/O
+            output_content = ""
+            if isinstance(tool_output, dict):
+                output_content = tool_output.get("content", "")
+            elif isinstance(tool_output, str):
+                output_content = tool_output
+            if output_content:
+                _update_read_cache(safe_path, output_content)
+            else:
+                # 回退：从文件读取
+                content = Path(safe_path).read_text(encoding="utf-8", errors="replace")
+                _update_read_cache(safe_path, content)
+        except Exception:
+            pass
 
     # ── 工具输出压缩 ─────────────────────────────────────────────────────
     compressed_output = _compress_tool_output(tool_name, tool_input, tool_output)
@@ -346,7 +456,7 @@ def _compress_tool_output(
 
 
 def _compress_grep_output(output: dict) -> dict:
-    """压缩 Grep 输出：限制上下文行数。"""
+    """压缩 Grep 输出：限制上下文行数，多匹配时剥离 content 字段。"""
     if not isinstance(output, dict):
         return output
 
@@ -356,19 +466,33 @@ def _compress_grep_output(output: dict) -> dict:
 
     max_context = DEFAULT_GREP_CONTEXT_LINES
     compressed = []
+    many_matches = len(matches) > 20
+
     for match in matches:
         if not isinstance(match, dict):
             compressed.append(match)
             continue
-        compressed_match = dict(match)
+
         context = match.get("context", [])
-        if isinstance(context, list) and len(context) > max_context * 2 + 1:
-            # 保留匹配行 + 前后各 N 行
+        needs_truncate = isinstance(context, list) and len(context) > max_context * 2 + 1
+        needs_strip = many_matches
+
+        if not needs_truncate and not needs_strip:
+            compressed.append(match)
+            continue
+
+        compressed_match = dict(match)
+        if needs_truncate:
             center = len(context) // 2
             start = max(0, center - max_context)
             end = min(len(context), center + max_context + 1)
             compressed_match["context"] = context[start:end]
             compressed_match["context_truncated"] = True
+
+        if needs_strip:
+            for key in ("content", "context", "context_truncated"):
+                compressed_match.pop(key, None)
+
         compressed.append(compressed_match)
 
     result = dict(output)
@@ -405,8 +529,101 @@ def _compress_glob_output(output: dict) -> dict:
 
 # ── 主入口 ────────────────────────────────────────────────────────────
 
+def _detect_format(event: dict) -> str:
+    """根据事件字段检测 Agent 格式。
+
+    Returns:
+        "claude" | "codex" | "openclaw" | "cursor" | "aider" | "continue" | "windsurf" | "unknown"
+    """
+    # Claude Code: 使用 hook_event_name 和 tool_name
+    if "hook_event_name" in event or "tool_name" in event:
+        return "claude"
+    # Aider: 使用 event 字段
+    if "event" in event and event.get("event") in ("pre_tool", "post_tool"):
+        return "aider"
+    # Continue: 使用 camelCase type 值
+    if event.get("type") in ("preToolUse", "postToolUse"):
+        return "continue"
+    # Cursor / Windsurf / OpenClaw / Codex: type + tool (统一格式)
+    if "type" in event and "tool" in event:
+        return "generic_tool"
+    return "unknown"
+
+
+def _get_adapter_for_format(fmt: str, raw: Optional[dict] = None) -> Any:
+    """根据格式字符串获取对应的适配器。
+
+    对于通用格式 (generic_tool)，尝试通过事件内容匹配适配器。
+    """
+    try:
+        from claude_token_saver.agents import get_adapter
+        from claude_token_saver.agents.base import AgentID
+
+        fmt_to_id = {
+            "claude": AgentID.CLAUDE_CODE,
+            "codex": AgentID.CODEX,
+            "openclaw": AgentID.OPENCLAW,
+            "cursor": AgentID.CURSOR,
+            "aider": AgentID.AIDER,
+            "continue": AgentID.CONTINUE,
+            "windsurf": AgentID.WINDSURF,
+        }
+        aid = fmt_to_id.get(fmt)
+        if aid:
+            return get_adapter(aid)
+
+        # generic_tool: 通过事件内容匹配适配器
+        if fmt == "generic_tool" and raw:
+            return _match_adapter_by_content(raw)
+    except Exception:
+        pass
+    return None
+
+
+def _match_adapter_by_content(raw: dict) -> Any:
+    """通过事件内容尝试匹配适配器。
+
+    对于 Codex/OpenClaw/Cursor/Windsurf 等使用相同格式的 Agent，
+    通过尝试解析来找到正确的适配器。
+    """
+    try:
+        from claude_token_saver.agents import get_adapter
+        from claude_token_saver.agents.base import AgentID
+
+        candidates = [
+            AgentID.CODEX,
+            AgentID.OPENCLAW,
+            AgentID.CURSOR,
+            AgentID.WINDSURF,
+        ]
+        for aid in candidates:
+            adapter = get_adapter(aid)
+            if adapter is None:
+                continue
+            try:
+                event = adapter.parse_inbound_event(raw)
+                # 成功解析且有工具名 → 认为是匹配的
+                if event.tool_name:
+                    return adapter
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
 def main() -> None:
-    """从 stdin 读取 JSON 事件，处理并输出 JSON 结果到 stdout。"""
+    """从 stdin 读取 JSON 事件，处理并输出 JSON 结果到 stdout。
+
+    支持多 Agent 格式自动检测：
+      - Claude Code (hook_event_name / tool_name)
+      - Codex CLI (type / tool)
+      - OpenClaw (type / tool)
+      - Cursor (type / tool)
+      - Aider (event / tool)
+      - Continue (type in camelCase)
+      - Windsurf (type / tool)
+    """
     try:
         raw = sys.stdin.read()
         if not raw.strip():
@@ -418,23 +635,33 @@ def main() -> None:
         print(json.dumps({"decision": "approve", "reason": ""}), file=sys.stdout)
         sys.exit(0)
 
-    tool_name: str = event.get("tool_name", "")
-    tool_input: dict = event.get("tool_input", {})
-    tool_output: dict | None = event.get("tool_output")
-    session_id: str | None = event.get("session_id")
-    event_type: str = event.get("hook_event_name", "")
+    # 检测 Agent 格式并选择适配器
+    fmt = _detect_format(event)
+    adapter = _get_adapter_for_format(fmt, event)
+
+    if adapter:
+        try:
+            from claude_token_saver.agents import process_event
+            result = process_event(event, adapter)
+            print(json.dumps(result), file=sys.stdout)
+            return
+        except Exception as e:
+            _record_security_event("handler_error", f"适配器处理异常: {type(e).__name__}", str(e)[:500])
+
+    # 回退：兼容旧版 Claude Code 格式（无适配器时）
+    from claude_token_saver.agents import process_event_direct
+    tool_name = event.get("tool_name", "")
+    tool_input = event.get("tool_input", {})
+    tool_output = event.get("tool_output") or {}
+    session_id = event.get("session_id")
+    event_type = event.get("hook_event_name", "")
 
     if not tool_name:
         print(json.dumps({"decision": "approve", "reason": "no tool_name"}), file=sys.stdout)
         sys.exit(0)
 
     try:
-        if event_type == "PreToolUse":
-            result = handle_pre_tool(tool_name, tool_input, session_id)
-        elif event_type == "PostToolUse":
-            result = handle_post_tool(tool_name, tool_input, tool_output or {}, session_id)
-        else:
-            result = {"decision": "approve", "reason": f"unknown event type: {event_type}"}
+        result = process_event_direct(tool_name, tool_input, tool_output, session_id, event_type)
     except Exception as e:
         _record_security_event("handler_error", f"Hook handler 异常: {type(e).__name__}", str(e)[:500])
         result = {"decision": "approve", "reason": ""}

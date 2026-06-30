@@ -1,5 +1,5 @@
 """
-Claude Code Token Saver - 会话管理模块
+Agent Token Saver - 会话管理模块
 提供自动 compact、主题会话、上下文恢复等功能。
 """
 from __future__ import annotations
@@ -14,7 +14,7 @@ from typing import Optional
 
 from claude_token_saver.utils import count_tokens
 
-DB_PATH = Path.home() / ".claude-token-saver" / "sessions.db"
+DB_PATH = Path.home() / ".agent-token-saver" / "sessions.db"
 
 
 @dataclass

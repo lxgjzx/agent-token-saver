@@ -1,5 +1,5 @@
 """
-Claude Code Token Saver - Hook 系统
+Agent Token Saver - Hook 系统
 配置、安装、卸载 Claude Code Hooks。
 """
 from __future__ import annotations

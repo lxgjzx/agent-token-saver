@@ -1,5 +1,5 @@
 """
-Claude Code Token Saver - 对话上下文压缩器
+Agent Token Saver - 对话上下文压缩器
 
 核心思路：旧轮次完全可以用摘要替代，释放大量 token。
 
@@ -259,33 +259,22 @@ class ConversationCompactor:
         )
 
     def format_for_prompt(self, context: CompactedContext) -> str:
-        """将压缩上下文格式化为可注入 prompt 的文本。"""
-        parts = []
-        parts.append(f"# 对话摘要（共 {context.original_turns} 轮，已压缩）\n")
+        """将压缩上下文格式化为可注入 prompt 的文本（紧凑格式）。"""
+        parts: list[str] = []
+        saved = context.total_tokens_before - context.total_tokens_after
+        pct = (saved / context.total_tokens_before * 100) if context.total_tokens_before else 0
+        parts.append(f"[摘要 {context.original_turns}→{context.compacted_turns}轮 节省{saved}tok {pct:.0f}%]\n")
 
         for s in context.summaries:
-            role = "用户" if s.turn_type == "user" else "助手"
-            parts.append(f"## 轮次 {s.turn_index} [{role}]")
+            parts.append(f"T{s.turn_index}{'U' if s.turn_type == 'user' else 'A'}:{s.summary}")
             if s.tool_calls:
-                parts.append(f"工具: {', '.join(s.tool_calls)}")
-            parts.append(s.summary)
-            if s.key_decisions:
-                parts.append(f"关键: {'; '.join(s.key_decisions)}")
-            parts.append("")
+                parts.append(f"  tools:{','.join(s.tool_calls[:2])}")
 
         if context.recent_turns:
-            parts.append(f"# 最近 {len(context.recent_turns)} 轮（完整）\n")
+            parts.append(f"[最近{len(context.recent_turns)}轮]\n")
             for turn in context.recent_turns:
-                role = "用户" if turn.get("type") == "user" else "助手"
-                content = turn.get("content", "")[:500]
-                parts.append(f"## 轮次 {turn.get('turn_index', '?')} [{role}]")
-                parts.append(content)
-                parts.append("")
-
-        saved = context.total_tokens_before - context.total_tokens_after
-        if context.total_tokens_before > 0:
-            pct = saved / context.total_tokens_before * 100
-            parts.append(f"\n--- 压缩节省 {saved:,} tokens ({pct:.0f}%) ---")
+                content = turn.get("content", "")[:300]
+                parts.append(f"T{turn.get('turn_index', '?')}{'F'}:{content}")
 
         return "\n".join(parts)
 
@@ -294,19 +283,9 @@ class ConversationCompactor:
         content = turn.get("content", "")
         turn_type = turn.get("type", "user")
 
-        # 策略：提取第一句话 + 工具调用摘要
-        sentences = content.replace("\n", " ").split(".")
-        first_sentence = sentences[0].strip() if sentences else ""
-
-        if turn_type == "user":
-            # 用户输入：提取核心请求（前 100 字符）
-            if len(content) > 100:
-                return content[:100].rstrip() + "..."
-            return content if content else "(空)"
-
-        # 助手回复：提取关键信息
+        # 助手回复有工具调用：生成结构化摘要
         tool_uses = turn.get("tool_uses", [])
-        if tool_uses:
+        if turn_type != "user" and tool_uses:
             tools = [t.get("name", "") for t in tool_uses]
             result_parts = []
             for t in tool_uses:
@@ -318,9 +297,18 @@ class ConversationCompactor:
                 summary += f" | {'; '.join(result_parts[:2])}"
             return summary
 
-        # 纯文本回复
-        if len(content) > 150:
-            return content[:150].rstrip() + "..."
+        # 纯文本摘要：token 感知截断
+        max_chars = 80 if turn_type == "user" else 120
+        if len(content) > max_chars:
+            # 尝试在句号处截断，保持语义完整
+            truncated = content[:max_chars]
+            last_period = truncated.rfind("。")
+            last_dot = truncated.rfind(".")
+            last_space = truncated.rfind(" ")
+            break_point = max(last_period, last_dot, last_space)
+            if break_point > max_chars * 0.5:
+                return content[:break_point + 1].rstrip() + "..."
+            return content[:max_chars].rstrip() + "..."
         return content if content else "(空)"
 
     def _extract_key_decisions(self, content: str) -> list[str]:

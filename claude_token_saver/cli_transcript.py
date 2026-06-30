@@ -1,30 +1,50 @@
 """
-transcript 子命令 - 解析 Claude Code transcript JSONL 文件
+transcript 子命令 - 解析多 Agent transcript JSONL 文件
 仅使用标准库：json, pathlib, sqlite3, datetime。
 """
 from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 
 import click
 
 from claude_token_saver.transcript import TranscriptParser
+from claude_token_saver.agents import get_registered_ids
+
+
+_AGENT_CHOICES = [aid.value for aid in get_registered_ids()]
+
+
+def _transcript_agent_option(f):
+    return click.option(
+        "--agent", "-a",
+        type=click.Choice(_AGENT_CHOICES, case_sensitive=False),
+        default=None,
+        help="指定 Agent（默认: 自动检测）",
+    )(f)
 
 
 @click.group()
 def transcript() -> None:
-    """解析 Claude Code transcript，提取会话、轮次、工具调用、Token 消耗和费用。"""
+    """解析多 Agent transcript，提取会话、轮次、工具调用、Token 消耗和费用。"""
     pass
 
 
 @transcript.command("scan")
-@click.option("--projects-dir", help="Claude projects 目录（默认 ~/.claude/projects/）")
+@click.option("--projects-dir", help="Agent projects 目录（默认自动检测）")
 @click.option("--json", "json_output", is_flag=True, help="JSON 格式输出")
-def transcript_scan(projects_dir: str | None, json_output: bool) -> None:
+@_transcript_agent_option
+def transcript_scan(
+    projects_dir: str | None,
+    json_output: bool,
+    agent: str | None,
+) -> None:
     """扫描 projects 目录，列出所有 transcript 文件。"""
     parser = TranscriptParser(
-        projects_dir=Path(projects_dir) if projects_dir else None
+        projects_dir=Path(projects_dir) if projects_dir else None,
+        agent_id=agent,
     )
     if not parser.projects_dir.exists():
         click.echo("📭 projects 目录不存在")
@@ -63,20 +83,21 @@ def transcript_scan(projects_dir: str | None, json_output: bool) -> None:
 
 @transcript.command("parse")
 @click.argument("path", required=False)
-@click.option("--projects-dir", help="Claude projects 目录")
+@click.option("--projects-dir", help="Agent projects 目录")
 @click.option("--json", "json_output", is_flag=True, help="JSON 格式输出")
 @click.option("--import-db", "import_db", is_flag=True, help="导入到 analytics DB")
+@_transcript_agent_option
 def transcript_parse(
     path: str | None,
     projects_dir: str | None,
     json_output: bool,
     import_db: bool,
+    agent: str | None,
 ) -> None:
     """解析 transcript 文件并显示会话/轮次/工具调用摘要。"""
-    from pathlib import Path
-
     parser = TranscriptParser(
-        projects_dir=Path(projects_dir) if projects_dir else None
+        projects_dir=Path(projects_dir) if projects_dir else None,
+        agent_id=agent,
     )
 
     # 确定要解析的文件列表

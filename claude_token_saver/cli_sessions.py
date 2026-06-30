@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import click
+import json
 
 from claude_token_saver.sessions import SessionManager
 

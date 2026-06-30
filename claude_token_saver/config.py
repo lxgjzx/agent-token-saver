@@ -1,5 +1,5 @@
 """
-Claude Code Token Saver - 配置管理
+Agent Token Saver - 配置管理
 """
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from pathlib import Path
 
 import yaml
 
-CONFIG_DIR = Path.home() / ".claude-token-saver"
+CONFIG_DIR = Path.home() / ".agent-token-saver"
 CONFIG_FILE = CONFIG_DIR / "config.yaml"
 
 DEFAULT_CONFIG: dict = {

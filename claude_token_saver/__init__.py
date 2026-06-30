@@ -1,1 +1,1 @@
-"""Claude Code Token Saver - 核心包"""
+"""Agent Token Saver - 核心包"""

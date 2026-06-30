@@ -1,0 +1,12 @@
+include README.md
+include LICENSE
+include pyproject.toml
+
+recursive-include claude_token_saver *.py
+recursive-include claude_token_saver *.pyi
+
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude *.so
+global-exclude .DS_Store
+global-exclude *.egg-info

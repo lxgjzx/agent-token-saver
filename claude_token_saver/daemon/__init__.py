@@ -1,7 +1,7 @@
 """
-Claude Code Token Saver - Daemon 监控服务
+Agent Token Saver - Daemon 监控服务
 
-后台扫描 ~/.claude/projects/ transcript JSONL，解析 usage 和 tool_use 事件，
+后台扫描所有 Agent 的 transcript JSONL，解析 usage 和 tool_use 事件，
 写入 analytics DB，并提供轻量 HTTP API。
 
 标准库依赖：threading, http.server, json, time, pathlib, sqlite3, signal
@@ -30,14 +30,43 @@ from typing import Any
 # 路径常量
 # ═══════════════════════════════════════════════════════════════════════════════
 
-DAEMON_DIR = Path.home() / ".claude-token-saver"
+DAEMON_DIR = Path.home() / ".agent-token-saver"
 PID_FILE = DAEMON_DIR / "daemon.pid"
 LOG_FILE = DAEMON_DIR / "daemon.log"
-CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 DB_PATH = DAEMON_DIR / "daemon_analytics.db"
 SCAN_INTERVAL = 30  # 扫描间隔（秒）
 HTTP_PORT = 17890  # HTTP API 端口
 API_TOKEN_FILE = DAEMON_DIR / ".api_token"  # API 认证 token 文件
+
+
+def _get_agent_transcript_dirs() -> list[Path]:
+    """返回所有已注册 Agent 的 transcript 目录。"""
+    try:
+        from claude_token_saver.agents import get_all_adapters
+        dirs = []
+        for adapter in get_all_adapters():
+            d = adapter.get_transcript_dir()
+            if d and d.exists():
+                dirs.append(d)
+        return dirs
+    except Exception:
+        # 回退：仅扫描 Claude Code
+        claude_dir = Path.home() / ".claude" / "projects"
+        return [claude_dir] if claude_dir.exists() else []
+
+
+def _get_agent_project_dirs() -> list[Path]:
+    """返回所有已注册 Agent 的 project 目录。"""
+    try:
+        from claude_token_saver.agents import get_all_adapters
+        dirs = []
+        for adapter in get_all_adapters():
+            d = adapter.get_project_dir()
+            if d and d.exists():
+                dirs.append(d)
+        return dirs
+    except Exception:
+        return []
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -136,8 +165,15 @@ def _get_conn() -> sqlite3.Connection:
     return conn
 
 
-# 初始化数据库
-_init_db()
+_db_initialized = False
+
+
+def _ensure_db() -> None:
+    """懒初始化数据库（幂等：多次调用只执行一次）。"""
+    global _db_initialized
+    if not _db_initialized:
+        _init_db()
+        _db_initialized = True
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -145,6 +181,7 @@ _init_db()
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _record_event(event: dict[str, Any]) -> None:
+    _ensure_db()
     conn = _get_conn()
     conn.execute(
         """INSERT INTO parsed_events
@@ -177,6 +214,7 @@ def _batch_record_events(events: list[dict[str, Any]]) -> None:
     """批量插入事件到 parsed_events 表（单事务，减少 I/O 开销）。"""
     if not events:
         return
+    _ensure_db()
     now = _utcnow()
     rows = [
         (
@@ -212,6 +250,7 @@ def _batch_record_events(events: list[dict[str, Any]]) -> None:
 
 def _record_alert(level: str, category: str, message: str,
                   data: dict[str, Any] | None = None) -> None:
+    _ensure_db()
     conn = _get_conn()
     conn.execute(
         "INSERT INTO alerts (level, category, message, data, timestamp) VALUES (?, ?, ?, ?, ?)",
@@ -222,6 +261,7 @@ def _record_alert(level: str, category: str, message: str,
 
 
 def _get_scan_state(file_path: str) -> dict[str, Any]:
+    _ensure_db()
     conn = _get_conn()
     row = conn.execute(
         "SELECT last_offset, last_mtime FROM scan_state WHERE file_path = ?",
@@ -234,6 +274,7 @@ def _get_scan_state(file_path: str) -> dict[str, Any]:
 
 
 def _update_scan_state(file_path: str, offset: int, mtime: float) -> None:
+    _ensure_db()
     conn = _get_conn()
     conn.execute(
         """INSERT OR REPLACE INTO scan_state (file_path, last_offset, last_mtime, updated_at)
@@ -379,14 +420,17 @@ def parse_transcript(file_path: Path) -> tuple[int, int]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _discover_jsonl_files() -> list[Path]:
-    """递归发现 projects 目录下所有 transcript JSONL 文件，排除 subagents。"""
-    if not CLAUDE_PROJECTS.exists():
-        return []
+    """递归发现所有 Agent 的 transcript JSONL 文件，排除 subagents。"""
+    dirs = _get_agent_transcript_dirs()
     files: list[Path] = []
-    for f in CLAUDE_PROJECTS.rglob("*.jsonl"):
-        if "subagents" in f.parts:
+    for d in dirs:
+        try:
+            for f in d.rglob("*.jsonl"):
+                if "subagents" in f.parts:
+                    continue
+                files.append(f)
+        except OSError:
             continue
-        files.append(f)
     return sorted(files, key=lambda p: str(p))
 
 
@@ -516,17 +560,22 @@ class _DaemonRequestHandler(BaseHTTPRequestHandler):
         uptime = int(time.time() - daemon.start_time) if daemon.start_time else 0
 
         # 从数据库补充统计
-        conn = _get_conn()
-        total_events = conn.execute(
-            "SELECT COUNT(*) FROM parsed_events"
-        ).fetchone()[0]
-        total_sessions = conn.execute(
-            "SELECT COUNT(DISTINCT session_id) FROM parsed_events"
-        ).fetchone()[0]
-        total_alerts = conn.execute(
-            "SELECT COUNT(*) FROM alerts"
-        ).fetchone()[0]
-        conn.close()
+        try:
+            conn = _get_conn()
+            total_events = conn.execute(
+                "SELECT COUNT(*) FROM parsed_events"
+            ).fetchone()[0]
+            total_sessions = conn.execute(
+                "SELECT COUNT(DISTINCT session_id) FROM parsed_events"
+            ).fetchone()[0]
+            total_alerts = conn.execute(
+                "SELECT COUNT(*) FROM alerts"
+            ).fetchone()[0]
+            conn.close()
+        except Exception:
+            total_events = 0
+            total_sessions = 0
+            total_alerts = 0
 
         self._json(200, {
             "status": "running" if (scanner and scanner.is_alive()) else "stopped",
@@ -535,7 +584,7 @@ class _DaemonRequestHandler(BaseHTTPRequestHandler):
             "scan_interval": daemon.scan_interval,
             "http_port": daemon.http_port,
             "scanner_alive": scanner.is_alive() if scanner else False,
-            "transcripts_dir": str(CLAUDE_PROJECTS),
+            "transcripts_dir": ", ".join(str(d) for d in _get_agent_transcript_dirs()),
             "db_path": str(DB_PATH),
             "total_events": total_events,
             "total_sessions": total_sessions,
@@ -544,23 +593,26 @@ class _DaemonRequestHandler(BaseHTTPRequestHandler):
         })
 
     def _route_sessions(self) -> None:
-        conn = _get_conn()
-        rows = conn.execute("""
-            SELECT session_id,
-                   MAX(model) as model,
-                   SUM(input_tokens) as total_input,
-                   SUM(output_tokens) as total_output,
-                   SUM(cache_creation_tokens) as total_cache_creation,
-                   SUM(cache_read_tokens) as total_cache_read,
-                   COUNT(*) as event_count,
-                   MIN(timestamp) as first_seen,
-                   MAX(timestamp) as last_seen
-            FROM parsed_events
-            GROUP BY session_id
-            ORDER BY last_seen DESC
-            LIMIT 50
-        """).fetchall()
-        conn.close()
+        try:
+            conn = _get_conn()
+            rows = conn.execute("""
+                SELECT session_id,
+                       MAX(model) as model,
+                       SUM(input_tokens) as total_input,
+                       SUM(output_tokens) as total_output,
+                       SUM(cache_creation_tokens) as total_cache_creation,
+                       SUM(cache_read_tokens) as total_cache_read,
+                       COUNT(*) as event_count,
+                       MIN(timestamp) as first_seen,
+                       MAX(timestamp) as last_seen
+                FROM parsed_events
+                GROUP BY session_id
+                ORDER BY last_seen DESC
+                LIMIT 50
+            """).fetchall()
+            conn.close()
+        except Exception:
+            rows = []
 
         sessions = []
         for r in rows:
@@ -583,23 +635,30 @@ class _DaemonRequestHandler(BaseHTTPRequestHandler):
         })
 
     def _route_alerts(self) -> None:
-        conn = _get_conn()
-        rows = conn.execute("""
-            SELECT id, level, category, message, data, timestamp, acknowledged
-            FROM alerts
-            ORDER BY timestamp DESC
-            LIMIT 50
-        """).fetchall()
-        conn.close()
+        try:
+            conn = _get_conn()
+            rows = conn.execute("""
+                SELECT id, level, category, message, data, timestamp, acknowledged
+                FROM alerts
+                ORDER BY timestamp DESC
+                LIMIT 50
+            """).fetchall()
+            conn.close()
+        except Exception:
+            rows = []
 
         alerts = []
         for r in rows:
+            try:
+                data = json.loads(r[4]) if r[4] else {}
+            except (json.JSONDecodeError, TypeError):
+                data = {}
             alerts.append({
                 "id": r[0],
                 "level": r[1],
                 "category": r[2],
                 "message": r[3],
-                "data": json.loads(r[4]) if r[4] else {},
+                "data": data,
                 "timestamp": r[5],
                 "acknowledged": bool(r[6]),
             })
@@ -787,27 +846,27 @@ def _is_pid_alive(pid: int | None) -> bool:
 
 
 def _force_kill(pid: int) -> None:
-    """强制终止进程（仅限本 daemon 启动的进程）。"""
-    # 验证 PID 属于当前用户且属于本 daemon
+    """强制终止进程（跨平台：Windows taskkill / Unix kill -9）。"""
     try:
-        # 检查进程是否存在且属于当前用户
-        result = subprocess.run(
-            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if str(pid) not in result.stdout:
-            log.warning("PID %d 不存在或不属于当前用户，跳过终止", pid)
-            return
-    except Exception as e:
-        log.error("验证 PID %d 失败: %s", pid, e)
-        return
-
-    try:
-        subprocess.run(
-            ["taskkill", "/F", "/PID", str(pid)],
-            capture_output=True, timeout=5,
-        )
+        if sys.platform == "win32":
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if str(pid) not in result.stdout:
+                log.warning("PID %d 不存在或不属于当前用户，跳过终止", pid)
+                return
+            subprocess.run(
+                ["taskkill", "/F", "/PID", str(pid)],
+                capture_output=True, timeout=5,
+            )
+        else:
+            # Unix: 先验证进程存在，再 SIGKILL
+            os.kill(pid, 0)  # raises ProcessLookupError if not exists
+            os.kill(pid, 9)
         log.info("已强制终止 PID %d", pid)
+    except (ProcessLookupError, PermissionError):
+        log.warning("PID %d 不存在或无权限，跳过终止", pid)
     except Exception as e:
         log.error("强制终止 PID %d 失败: %s", pid, e)
 
@@ -828,13 +887,30 @@ def _generate_api_token() -> str:
     token = secrets.token_urlsafe(32)
     DAEMON_DIR.mkdir(parents=True, exist_ok=True)
     API_TOKEN_FILE.write_text(token, encoding="utf-8")
-    API_TOKEN_FILE.chmod(0o600)  # 仅所有者可读
+    _restrict_token_file()
     _invalidate_api_token_cache()
     return token
 
 
+def _restrict_token_file() -> None:
+    """限制 token 文件权限：Unix 用 chmod，Windows 用 icacls。"""
+    try:
+        username = os.environ.get("USERNAME", os.environ.get("USER", ""))
+        if sys.platform == "win32" and username:
+            subprocess.run(
+                ["icacls", str(API_TOKEN_FILE), "/inheritance:r",
+                 "/grant:r", f"{username}:(R)"],
+                capture_output=True, timeout=5,
+            )
+        else:
+            API_TOKEN_FILE.chmod(0o600)
+    except Exception:
+        pass  # 权限限制失败不影响功能
+
+
 def _invalidate_api_token_cache() -> None:
-    _API_TOKEN_CACHE = None  # type: ignore[misc]
+    global _API_TOKEN_CACHE
+    _API_TOKEN_CACHE = None
 
 
 def _get_api_token() -> str | None:
@@ -908,16 +984,23 @@ def start_daemon(
             _generate_api_token()
 
         try:
+            kwargs: dict[str, Any] = {
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
+                "close_fds": True,
+            }
+            if sys.platform == "win32":
+                kwargs["creation_flags"] = subprocess.DETACHED_PROCESS
+            else:
+                kwargs["start_new_session"] = True
+
             proc = subprocess.Popen(
                 [
                     sys.executable, "-c",
                     f"from claude_token_saver.daemon import _run_detached; "
                     f"_run_detached(scan_interval={scan_interval}, http_port={http_port})",
                 ],
-                creation_flags=subprocess.DETACHED_PROCESS if sys.platform == "win32" else 0,
-                close_fds=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                **kwargs,
             )
             log.info("Daemon 子进程已启动 PID=%d", proc.pid)
             # 等待子进程写入 PID 文件
@@ -952,7 +1035,13 @@ def stop_daemon() -> bool:
 
     log.info("正在停止 daemon (PID %d)...", pid)
     try:
-        os.kill(pid, signal.SIGTERM)
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/T", "/PID", str(pid)],
+                capture_output=True, timeout=5,
+            )
+        else:
+            os.kill(pid, signal.SIGTERM)
     except PermissionError:
         log.error("没有权限终止 PID %d", pid)
         return False
@@ -1001,7 +1090,7 @@ def get_daemon_status() -> dict[str, Any]:
         "pid_file": str(PID_FILE),
         "log_file": str(LOG_FILE),
         "db_path": str(DB_PATH),
-        "transcripts_dir": str(CLAUDE_PROJECTS),
+        "transcripts_dir": ", ".join(str(d) for d in _get_agent_transcript_dirs()),
         "timestamp": _utcnow(),
     }
 

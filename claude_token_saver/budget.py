@@ -1,5 +1,5 @@
 """
-Claude Code Token Saver - 自适应预算分配器
+Agent Token Saver - 自适应预算分配器
 
 核心思路：不靠用户手动指定压缩级别，而是根据剩余 token 预算
 自动为每个文件分配最优的 detail_level。

@@ -1,0 +1,21 @@
+{
+  "name": "agent-token-saver",
+  "version": "0.2.0",
+  "description": "AI Coding Agent Token Saver - reduce token consumption across Claude Code, Codex, Cursor, Aider and more",
+  "keywords": [
+    "ai", "agent", "token", "claude", "codex", "cursor",
+    "aider", "cost-saving", "prompt-optimization"
+  ],
+  "homepage": "https://github.com/your-repo/agent-token-saver",
+  "license": "MIT",
+  "bin": {
+    "agent-token-saver": "./bin/cli.js",
+    "ats": "./bin/cli.js"
+  },
+  "scripts": {
+    "postinstall": "python -m pip install --quiet --upgrade agent-token-saver || true"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}

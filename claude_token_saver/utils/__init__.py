@@ -1,5 +1,5 @@
 """
-Claude Code Token Saver - 工具函数库
+Agent Token Saver - 工具函数库
 """
 from __future__ import annotations
 
@@ -16,14 +16,27 @@ def get_file_hash(path: str | Path) -> str:
 
 
 def count_tokens(text: str, model: str = "claude-sonnet-4-20250514") -> int:
-    """估算文本的 token 数量。"""
+    """估算文本的 token 数量。
+
+    优先使用 tiktoken 精确计算，回退到字符类型感知的启发式估算。
+    """
+    if not text:
+        return 0
     try:
         import tiktoken
-        enc = tiktoken.encoding_for_model("gpt-4o")  # Claude 兼容的 encoding
-        return len(enc.encode(text))
+        # 缓存 encoding 对象，避免每次调用都重新加载
+        if not hasattr(count_tokens, "_enc"):
+            count_tokens._enc = tiktoken.encoding_for_model("gpt-4o")
+        return len(count_tokens._enc.encode(text))
     except Exception:
-        # 回退：粗略估算（中英混合约 1.5 token/字符）
-        return int(len(text) * 1.5)
+        # 回退：字符类型感知估算
+        # - CJK 字符（中/日/韩）: ~2 tokens/char
+        # - ASCII 单词字符: ~0.25 tokens/char (4 chars/token)
+        cjk_count = sum(1 for ch in text if "一" <= ch <= "鿿" or "　" <= ch <= "〿")
+        if cjk_count > len(text) * 0.3:
+            return int(len(text) * 0.6)
+        else:
+            return max(1, int(len(text) * 0.25))
 
 
 def is_binary_file(path: str | Path) -> bool:

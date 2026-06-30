@@ -8,6 +8,7 @@ import sys
 import click
 
 from claude_token_saver.prep import process_files, format_processed_output
+from claude_token_saver.sessions import SessionManager
 from claude_token_saver.utils import should_ignore
 from claude_token_saver.config import load_config
 
@@ -21,7 +22,7 @@ def prep() -> None:
 @prep.command("files")
 @click.argument("paths", nargs=-1, required=True, type=click.Path(exists=True))
 @click.option("-o", "--output", help="输出文件路径（默认打印到 stdout）")
-@click.option("--format", type=click.Choice(["markdown", "plain", "json"]), default="markdown", help="输出格式")
+@click.option("--format", type=click.Choice(["markdown", "markdown-compact", "plain", "raw", "super-compact", "json"]), default="markdown", help="输出格式（super-compact 最省 token，使用 --- 分隔符）")
 @click.option("--no-strip-comments", is_flag=True, help="不去除注释")
 @click.option("--strip-docstrings", is_flag=True, help="去除 Python 文档字符串")
 @click.option("--no-dedup", is_flag=True, help="不去重")
@@ -36,8 +37,16 @@ def prep() -> None:
 @click.option("--token-budget", type=int, default=50_000, help="token 预算（--auto-detail 时使用）")
 # 新增：结构去重
 @click.option("--structural-dedup", is_flag=True, help="基于代码结构相似度去重（超越 MD5）")
+# 新增：常见文件组去重
+@click.option("--common-dedup", is_flag=True, help="过滤常见结构重复文件（__init__.py, conftest.py 等）")
 # 新增：渐进式披露（目录索引模式）
 @click.option("--index", is_flag=True, help="仅输出目录索引（不读取文件内容）")
+# 新增：紧凑输出模式（省略文件标题，节省 ~20% token）
+@click.option("--compact", is_flag=True, help="紧凑输出（省略文件标题，等效于 --format markdown-compact）")
+# 新增：近似重复检测（SimHash，识别相似但非完全相同的文件）
+@click.option("--near-dedup", is_flag=True, help="检测近似重复文件（SimHash，识别相似但不完全相同的文件）")
+# 新增：索引紧凑模式
+@click.option("--compact-index", is_flag=True, help="目录索引用最紧凑格式（仅文件列表，~60% token）")
 def prep_files(
     paths: tuple[str],
     output: str | None,
@@ -54,7 +63,11 @@ def prep_files(
     auto_detail: bool,
     token_budget: int,
     structural_dedup: bool,
+    common_dedup: bool,
     index: bool,
+    compact: bool,
+    near_dedup: bool,
+    compact_index: bool,
 ) -> None:
     """处理文件列表，输出精简后的内容。
 
@@ -91,10 +104,10 @@ def prep_files(
     if index:
         click.echo(f"📂 构建目录索引（{len(expanded)} 个路径）...")
         from claude_token_saver.prep import build_directory_index, format_index_for_prompt
-        idx = build_directory_index(expanded, include_binary=include_binary)
+        idx = build_directory_index(expanded, include_binary=include_binary, common_dedup=common_dedup)
         click.echo(f"   索引文件: {idx['total_files']} 个")
         click.echo(f"   估计 token: {idx['total_estimated_tokens']:,}")
-        output_text = format_index_for_prompt(idx, format=format)
+        output_text = format_index_for_prompt(idx, format=format, compact=compact_index)
         if output:
             __import__("pathlib").Path(output).write_text(output_text, encoding="utf-8")
             click.echo(f"\n✅ 索引已保存到: {output}")
@@ -116,6 +129,44 @@ def prep_files(
         dup_count = before - len(expanded)
         if dup_count:
             click.echo(f"   结构重复: {dup_count} 个文件已去重")
+
+    # ── 常见文件组去重 ───────────────────────────────────────────────────
+    if common_dedup:
+        click.echo("🔍 常见文件组去重中...")
+        from claude_token_saver.common_dedup import filter_common_duplicates, get_common_pattern_summary
+        suggestions = get_common_pattern_summary(expanded)
+        for s in suggestions:
+            click.echo(f"   💡 {s}")
+        expanded_cp = list(expanded)
+        expanded_cp, skipped = filter_common_duplicates([__import__("pathlib").Path(p) for p in expanded_cp])
+        expanded = [str(p) for p in expanded_cp]
+        skipped_count = len(expanded_cp) - len(expanded)
+        if skipped_count:
+            click.echo(f"   跳过: {skipped_count} 个常见重复文件")
+
+    # ── 近似重复检测 ─────────────────────────────────────────────────────
+    if near_dedup:
+        click.echo("🔍 近似重复检测中（SimHash）...")
+        from claude_token_saver.simhash_dedup import find_near_duplicates, get_near_dup_suggestions
+        groups = find_near_duplicates(expanded, threshold=3)
+        if groups:
+            for s in get_near_dup_suggestions(groups):
+                click.echo(f"   💡 {s}")
+            # 过滤：每组只保留代表文件
+            keep_paths = set()
+            for g in groups:
+                keep_paths.add(g.representative)
+                keep_paths.update(g.duplicates)
+            # 只移除重复的，保留代表
+            to_remove = set()
+            for g in groups:
+                for dup in g.duplicates:
+                    if dup in expanded:
+                        to_remove.add(dup)
+            expanded = [p for p in expanded if p not in to_remove]
+            click.echo(f"   移除: {len(to_remove)} 个近似重复文件")
+        else:
+            click.echo("   ✅ 未发现近似重复文件")
 
     result = process_files(
         expanded,
@@ -148,16 +199,26 @@ def prep_files(
         click.echo(f"\n📁 各文件节省情况：")
         click.echo(f"   {'文件':<50} {'级别':<10} {'压缩前':>10} {'压缩后':>10} {'节省':>10}")
         click.echo(f"   {'─' * 50} {'─' * 10} {'─' * 10} {'─' * 10}")
+        # 路径缩写映射
+        try:
+            from claude_token_saver.path_optimizer import abbreviate_path
+            project_root = __import__("os").getcwd()
+        except Exception:
+            abbreviate_path = lambda p, _: p
+            project_root = ""
         for f in result["files"]:
             lvl = f.get("detail_level", detail_level)
             savings_pct = (f["savings"] / f["tokens_before"] * 100) if f["tokens_before"] else 0
-            click.echo(f"   {str(f['path']):<50} {lvl:<10} {f['tokens_before']:>10,} {f['tokens_after']:>10,} "
+            abbr = abbreviate_path(f["path"], project_root)
+            click.echo(f"   {abbr:<50} {lvl:<10} {f['tokens_before']:>10,} {f['tokens_after']:>10,} "
                        f"{savings_pct:>9.0f}%")
 
     if dry_run:
         return
 
-    output_text = format_processed_output(result, format=format)
+    # --compact 覆盖 format 为紧凑模式
+    output_format = "markdown-compact" if compact else format
+    output_text = format_processed_output(result, format=output_format)
 
     if output:
         __import__("pathlib").Path(output).write_text(output_text, encoding="utf-8")

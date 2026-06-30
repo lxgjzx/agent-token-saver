@@ -1,5 +1,5 @@
 """
-Claude Code Token Saver - 渐进式披露（Progressive Disclosure）
+Agent Token Saver - 渐进式披露（Progressive Disclosure）
 
 核心思路：不一次性返回所有文件内容，而是先返回目录索引，
 Claude 按需请求具体文件。
@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from claude_token_saver.utils import get_file_size, should_ignore
+from claude_token_saver.prep import estimate_tokens_from_size
 
 
 @dataclass
@@ -123,8 +124,19 @@ def build_directory_index(
     )
 
 
-def format_index_markdown(index: DirectoryIndex) -> str:
-    """将目录索引格式化为 Markdown（供 Claude 消费）。"""
+def format_index_markdown(index: DirectoryIndex, compact: bool = False) -> str:
+    """将目录索引格式化为 Markdown（供 Claude 消费）。
+
+    Args:
+        compact: 如果 True，使用最紧凑格式（仅文件列表，无目录分组）
+    """
+    if compact:
+        # 最紧凑模式：仅文件列表 + token 估算，~60% token
+        parts = [f"# 项目索引（{index.total_files} 文件，~{index.total_tokens:,} tok）\n"]
+        for e in sorted(index.files, key=lambda e: -e.estimated_tokens):
+            parts.append(f"`{e.relative_path}` ~{e.estimated_tokens:,}tok")
+        return "\n".join(parts)
+
     parts = []
     parts.append(f"# 项目目录索引（{index.total_files} 个文件，约 {index.total_tokens:,} tokens）\n")
     parts.append(f"根目录: `{index.root}`\n")
@@ -181,23 +193,6 @@ def format_index_json(index: DirectoryIndex) -> str:
             for d, entries in index.by_directory.items()
         },
     }, ensure_ascii=False, indent=2)
-
-
-def estimate_tokens_from_size(size_bytes: int, ext: str) -> int:
-    """根据文件大小和类型估算 token 数量。
-
-    不同语言每字节的平均 token 数不同：
-      - 文本文件（代码）: ~0.125 token/char
-      - JSON/YAML: ~0.15 token/char（更冗长）
-      - Markdown: ~0.12 token/char
-    """
-    if ext.lower() in {".json", ".yaml", ".yml", ".toml"}:
-        ratio = 0.15
-    elif ext.lower() in {".md", ".txt", ".rst"}:
-        ratio = 0.12
-    else:
-        ratio = 0.125  # 代码文件
-    return max(1, int(size_bytes * ratio))
 
 
 def _make_entry(file_path: Path, root: Path) -> FileIndexEntry | None:

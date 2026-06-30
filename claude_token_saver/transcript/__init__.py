@@ -1,5 +1,5 @@
 """
-Claude Code Token Saver - Transcript 解析模块
+Agent Token Saver - Transcript 解析模块
 解析 ~/.claude/projects/ 下的 JSONL transcript 文件。
 仅使用标准库：json, pathlib, sqlite3, datetime。
 """
@@ -197,18 +197,58 @@ class CostRecord:
 # ── 解析器 ──────────────────────────────────────────────────────────
 
 class TranscriptParser:
-    """Claude Code transcript JSONL 解析器。
+    """多 Agent transcript JSONL 解析器。
 
     使用方式：
-        parser = TranscriptParser()
+        parser = TranscriptParser()                          # 自动检测 Agent
+        parser = TranscriptParser(agent_id="codex")          # 指定 Agent
+        parser = TranscriptParser(projects_dir="/path/to/")  # 指定目录
         results = parser.parse_directory()           # 扫描整个 projects 目录
         session, turns = parser.parse_file(path)     # 解析单个文件
         event = parser.parse_line(line)              # 解析单行 JSON
         count = parser.import_to_db(results)         # 写入 analytics DB
     """
 
-    def __init__(self, projects_dir: Path | None = None):
-        self.projects_dir = projects_dir or (Path.home() / ".claude" / "projects")
+    def __init__(self, projects_dir: Path | None = None, agent_id: str | None = None):
+        if projects_dir:
+            self.projects_dir = projects_dir
+        elif agent_id:
+            self.projects_dir = _resolve_agent_projects_dir(agent_id)
+        else:
+            # 自动检测
+            self.projects_dir = _resolve_agent_projects_dir(None)
+
+        self.agent_id = agent_id
+
+
+def _resolve_agent_projects_dir(agent_id: str | None) -> Path:
+    """根据 Agent 标识符返回对应的 projects/sessions 目录。"""
+    try:
+        from claude_token_saver.agents import get_adapter
+        from claude_token_saver.agents.base import AgentID
+
+        if agent_id:
+            try:
+                aid = AgentID(agent_id.lower())
+            except ValueError:
+                aid = None
+        else:
+            # 自动检测
+            from claude_token_saver.agents import detect_agent
+            adapter = detect_agent()
+            aid = adapter.agent_id if adapter else None
+
+        if aid:
+            adapter = get_adapter(aid)
+            if adapter:
+                d = adapter.get_transcript_dir()
+                if d:
+                    return d
+    except Exception:
+        pass
+
+    # 回退：Claude Code
+    return Path.home() / ".claude" / "projects"
 
     # ── 目录扫描 ──
 
@@ -517,7 +557,7 @@ class TranscriptParser:
         if not parsed:
             return 0
 
-        analytics_path = db_path or (Path.home() / ".claude-token-saver" / "analytics.db")
+        analytics_path = db_path or (Path.home() / ".agent-token-saver" / "analytics.db")
         analytics_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(analytics_path)
 

@@ -1,5 +1,5 @@
 """
-Claude Code Token Saver - 统计分析模块
+Agent Token Saver - 统计分析模块
 追踪 token 消耗、识别浪费、提供优化建议。
 """
 from __future__ import annotations
@@ -14,7 +14,7 @@ from typing import Any
 from claude_token_saver.utils import count_tokens, get_file_size
 from claude_token_saver.sessions import SessionManager
 
-DB_PATH = Path.home() / ".claude-token-saver" / "analytics.db"
+DB_PATH = Path.home() / ".agent-token-saver" / "analytics.db"
 
 
 @dataclass

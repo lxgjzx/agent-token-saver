@@ -1,8 +1,31 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
 [project]
-name = "claude-token-saver"
-version = "0.1.0"
-description = "Claude Code token 节省综合工具套件"
+name = "agent-token-saver"
+version = "0.2.0"
+description = "AI Agent Token Saver - 减少多 Agent 平台 token 消耗的综合工具（支持 Claude Code, Codex, OpenClaw, Cursor, Aider, Continue, Windsurf）"
+readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.10"
+authors = [
+    { name = "agent-token-saver contributors" },
+]
+keywords = ["ai", "agent", "token", "claude", "codex", "openclaw", "cursor", "aider", "cost-saving", "prompt-optimization"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Utilities",
+]
 dependencies = [
     "click>=8.1",
     "rich>=13.7",
@@ -17,8 +40,17 @@ dev = [
 ]
 
 [project.scripts]
-claude-token-saver = "claude_token_saver.cli:main"
-cts = "claude_token_saver.cli:main"
+agent-token-saver = "claude_token_saver.cli:main"
+ats = "claude_token_saver.cli:main"
+ats-setup = "claude_token_saver.cli:setup_auto"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["claude_token_saver*"]
+
+[tool.setuptools.package-data]
+claude_token_saver = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-v --tb=short"
